@@ -252,7 +252,7 @@
 <div class="toast-stack" id="toast-stack"></div>
 
 <!-- ============ SETUP SCREEN (Firebase chưa cấu hình) ============ -->
-<div class="setup-wrap" id="setup-screen">
+<div class="hidden setup-wrap" id="setup-screen">
   <div class="setup-card">
     <div class="auth-logo">B2 PRODUCTION SYSTEM</div>
     <p class="hint" style="margin-bottom:18px;">Chưa tìm thấy cấu hình Firebase hợp lệ. Làm theo 4 bước bên dưới rồi tải lại trang.</p>
@@ -1294,7 +1294,7 @@ function boot(){
 }
 
 function hideAllScreens(){
-  ['auth-screen','pending-screen','app-shell'].forEach(id=>document.getElementById(id).classList.add('hidden'));
+  ['setup-screen','auth-screen','pending-screen','app-shell'].forEach(id=>document.getElementById(id).classList.add('hidden'));
 }
 
 function routeByStatus(){
