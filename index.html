@@ -76,7 +76,7 @@
 
   /* ---------- layout shell ---------- */
   #app-shell{display:grid;grid-template-columns:236px 1fr;min-height:100vh;}
-  @media (max-width:860px){ #app-shell{grid-template-columns:1fr;} #sidebar{position:fixed;z-index:40;height:100vh;transform:translateX(-100%);transition:transform .25s ease;} #sidebar.open{transform:translateX(0);} }
+  @media (max-width:860px){ #app-shell{grid-template-columns:1fr;} #sidebar{position:fixed;z-index:40;height:100vh;transform:translateX(-100%);transition:transform .25s ease;overflow-y:auto;-webkit-overflow-scrolling:touch;} #sidebar.open{transform:translateX(0);} }
 
   #sidebar{background:var(--graphite-900);color:#EDEBE4;display:flex;flex-direction:column;padding:22px 16px;gap:4px;border-right:1px solid var(--line);}
   .brand{display:flex;flex-direction:column;gap:2px;padding:6px 10px 20px 10px;border-bottom:1px solid var(--graphite-700);margin-bottom:14px;}
