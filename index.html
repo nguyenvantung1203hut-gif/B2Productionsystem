@@ -1652,23 +1652,75 @@ window.filterWarehouseLots = function(){
       return (l.lotCode||'').toLowerCase().includes(q) || (it?.name||'').toLowerCase().includes(q) || (it?.code||'').toLowerCase().includes(q);
     });
   }
-  rows = rows.slice().sort((a,b)=>(b.lotCode||'').localeCompare(a.lotCode||''));
-  el.innerHTML = rows.length ? `
-    <p class="hint" style="margin-bottom:8px;">${rows.length} lô ${q?'khớp bộ lọc':'trong Kho thành phẩm'}${q?` (trong tổng ${warehouseLotsCache.length})`:''}</p>
-    <div class="table-wrap"><table><thead><tr><th>Mã lô</th><th>Mã</th><th>Tên</th><th>Công đoạn tạo</th><th style="text-align:right;">Tồn</th><th>Ngày đóng gói</th><th>Người đóng gói</th></tr></thead><tbody>
-      ${rows.map(l=>{
-        const it = state.items.find(i=>i.id===l.itemId);
-        return `<tr>
-          <td class="mono">${l.isUnknown? '<span class="hint">Chưa xác định</span>' : (l.lotCode?esc(l.lotCode):'—')}</td>
-          <td class="mono">${it?.code?esc(it.code):'—'}</td>
-          <td>${itemName(l.itemId)}</td>
-          <td>${l.isUnknown? '<span class="hint">Tồn kho cũ</span>' : esc(l.stage)}</td>
-          <td style="text-align:right;" class="mono">${fmt(l.stock)} ${itemUnit(l.itemId)}</td>
-          <td class="mono">${l.packedAt?.toDate ? l.packedAt.toDate().toLocaleString('vi-VN') : '—'}</td>
-          <td>${l.packedBy?esc(l.packedBy):'—'}</td>
+
+  if (!rows.length) {
+    el.innerHTML = emptyState(q ? 'Không có lô nào khớp tìm kiếm.' : 'Kho thành phẩm hiện chưa có cuộn nào — hãy đóng gói ở tab "Đóng gói" trước.');
+    return;
+  }
+
+  // Gộp các lô theo MÃ HÀNG (itemId) để hiện tổng khối lượng từng mã, bấm để xổ xuống xem chi tiết từng lô.
+  // Lưu ý: "chưa xác định" chỉ nghĩa là chưa quét được MÃ LÔ, lô đó vẫn thuộc 1 mã hàng cụ thể —
+  // nên KHÔNG được gộp theo isUnknown kẻo lẫn lộn mã hàng của các lô chưa xác định với nhau.
+  const groups = {};
+  const groupOrder = [];
+  rows.forEach(l=>{
+    const key = l.itemId || '__none__';
+    if (!groups[key]) { groups[key] = { itemId: l.itemId, lots: [], totalStock: 0 }; groupOrder.push(key); }
+    groups[key].lots.push(l);
+    groups[key].totalStock += (l.stock||0);
+  });
+
+  let groupList = groupOrder.map(k=>groups[k]);
+  groupList.sort((a,b)=>{
+    const ca = state.items.find(i=>i.id===a.itemId)?.code || '';
+    const cb = state.items.find(i=>i.id===b.itemId)?.code || '';
+    return ca.localeCompare(cb);
+  });
+
+  const expanded = !!q; // đang tìm kiếm thì tự xổ sẵn để thấy ngay lô khớp
+
+  el.innerHTML = `
+    <p class="hint" style="margin-bottom:8px;">${groupList.length} mã · ${rows.length} lô ${q?'khớp bộ lọc':'trong Kho thành phẩm'}${q?` (trong tổng ${warehouseLotsCache.length})`:''}</p>
+    <div class="table-wrap"><table><thead><tr><th style="width:24px;"></th><th>Mã hàng</th><th>Tên</th><th style="text-align:right;">Tổng khối lượng</th><th style="text-align:right;">Số lô</th></tr></thead><tbody>
+      ${groupList.map((g,gi)=>{
+        const it = state.items.find(i=>i.id===g.itemId);
+        const gid = `wh-grp-${gi}`;
+        const lotsSorted = g.lots.slice().sort((a,b)=>(b.lotCode||'').localeCompare(a.lotCode||''));
+        return `
+        <tr class="wh-group-row" style="cursor:pointer;" onclick="toggleWhGroup('${gid}')">
+          <td class="mono" id="${gid}-icon">${expanded?'▼':'▶'}</td>
+          <td class="mono">${esc(it?.code||'—')}</td>
+          <td>${itemName(g.itemId)}</td>
+          <td style="text-align:right;" class="mono">${fmt(g.totalStock)} ${itemUnit(g.itemId)}</td>
+          <td style="text-align:right;" class="mono">${g.lots.length}</td>
+        </tr>
+        <tr id="${gid}" class="${expanded?'':'hidden'}">
+          <td colspan="5" style="padding:0;">
+            <div style="padding:6px 8px 10px 32px;">
+              <table><thead><tr><th>Mã lô</th><th>Công đoạn tạo</th><th style="text-align:right;">Tồn</th><th>Ngày đóng gói</th><th>Người đóng gói</th></tr></thead><tbody>
+                ${lotsSorted.map(l=>`
+                  <tr>
+                    <td class="mono">${l.isUnknown? '<span class="hint">Chưa xác định</span>' : (l.lotCode?esc(l.lotCode):'—')}</td>
+                    <td>${l.isUnknown? '<span class="hint">Tồn kho cũ</span>' : esc(l.stage)}</td>
+                    <td style="text-align:right;" class="mono">${fmt(l.stock)} ${itemUnit(l.itemId)}</td>
+                    <td class="mono">${l.packedAt?.toDate ? l.packedAt.toDate().toLocaleString('vi-VN') : '—'}</td>
+                    <td>${l.packedBy?esc(l.packedBy):'—'}</td>
+                  </tr>`).join('')}
+              </tbody></table>
+            </div>
+          </td>
         </tr>`;
       }).join('')}
-    </tbody></table></div>` : emptyState(q ? 'Không có lô nào khớp tìm kiếm.' : 'Kho thành phẩm hiện chưa có cuộn nào — hãy đóng gói ở tab "Đóng gói" trước.');
+    </tbody></table></div>`;
+};
+
+window.toggleWhGroup = function(gid){
+  const row = document.getElementById(gid);
+  const icon = document.getElementById(gid+'-icon');
+  if (!row) return;
+  const willShow = row.classList.contains('hidden');
+  row.classList.toggle('hidden');
+  if (icon) icon.textContent = willShow ? '▼' : '▶';
 };
 
 async function loadTodayPacking(){
@@ -2857,6 +2909,14 @@ window.generateReport = async function(){
         adjust: roundQty(adjust), closing: roundQty(closing)
       };
     });
+    // Sắp xếp báo cáo: theo nhóm Nguyên liệu → Bán thành phẩm → Thành phẩm → Hàng hỏng/Phế phẩm,
+    // trong mỗi nhóm sắp theo mã sản phẩm tăng dần (so sánh tự nhiên, số trong mã so đúng thứ tự số).
+    const REPORT_TYPE_ORDER = { raw: 0, semi: 1, fg: 2, scrap: 3 };
+    rows.sort((a,b)=>{
+      const ta = REPORT_TYPE_ORDER[a.type] ?? 99, tb = REPORT_TYPE_ORDER[b.type] ?? 99;
+      if (ta !== tb) return ta - tb;
+      return (a.code||'').localeCompare(b.code||'', 'vi', { numeric: true, sensitivity: 'base' });
+    });
     window._lastReportRows = rows;
     window._lastReportMonth = monthVal;
     document.getElementById('report-export-btn').disabled = rows.length===0;
@@ -3668,6 +3728,13 @@ window.submitProduction = async function(btn){
         tx.set(ledgerRef, { itemId:r.itemId, delta:r.qty, type:'coproduct_produce', date, refId:reportRef.id, createdAt: serverTimestamp() });
       });
     });
+    // Danh sách lô vừa sinh ra (chỉ Tháo cuộn/Xẻ băng — Casting ra "cuộn lớn" chưa phải đơn vị đóng gói
+    // cuối nên không cần tem ở bước này) — dùng để hiện panel "In tem" ngay sau khi lưu thành công.
+    const createdLotsForPrint = [];
+    if (needsParentLot) {
+      if (mainLotCode) createdLotsForPrint.push({ lotCode: mainLotCode, itemId: outputItemId, qty: outputQty });
+      secondaryOutputs.forEach((r,idx)=>{ if (secLotCodes[idx]) createdLotsForPrint.push({ lotCode: secLotCodes[idx], itemId: r.itemId, qty: r.qty }); });
+    }
     toast(mainLotCode ? `Đã lưu báo cáo sản xuất — mã lô: ${mainLotCode}` : 'Đã lưu báo cáo sản xuất — tồn kho đã được cập nhật.', 'success');
     invalidateSnapshotsFrom(date);
     prodConsumedRows = [];
@@ -3675,6 +3742,7 @@ window.submitProduction = async function(btn){
     prodParentLot = null;
     prodReslitMode = false;
     setTab('production');
+    if (createdLotsForPrint.length) showPrintOfferPanel(createdLotsForPrint);
   } catch(err){
     toast('Lỗi: ' + err.message, 'error');
   }
@@ -3682,8 +3750,73 @@ window.submitProduction = async function(btn){
 };
 
 /* ---------------------------------------------------------------------
-   REWORK — chuyển bán thành phẩm/thành phẩm lỗi sang mã khác
+   IN TEM CUỘN — hàng đợi in (printQueue)
+   Sau khi lưu báo cáo Tháo cuộn/Xẻ băng, hiện danh sách các lô vừa sinh ra, cho phép gửi lệnh in
+   tem cho từng lô (không tự động in ngay — công nhân tự quyết định khi nào cuộn đó là cuộn CUỐI
+   CÙNG sẵn sàng đóng gói, vì 1 lô Tháo cuộn có thể còn bị Xẻ băng tiếp sau đó).
+   Dữ liệu ghi vào collection `printQueue` được 1 script ngoài (chạy trên máy đang có phần mềm in
+   tem Zebra hiện tại) đọc và tự điền vào app in — không ai phải gõ tay lại mã lô/mã hàng/khối lượng.
+   3 trường app in hiện chưa có dữ liệu tương ứng trong hệ thống (Num of distruptions, Work Order,
+   Employee ID) tạm để cố định — sửa ở PRINT_LABEL_DEFAULTS khi hệ thống có dữ liệu thật cho chúng.
 --------------------------------------------------------------------- */
+const PRINT_LABEL_DEFAULTS = { numOfDistruptions: 0, workOrder: '1234', employeeId: 'MV080' };
+
+window.showPrintOfferPanel = function(lots){
+  const rowsHtml = lots.map((l,idx)=>{
+    const it = state.items.find(i=>i.id===l.itemId);
+    return `
+    <tr id="print-row-${idx}">
+      <td class="mono">${esc(l.lotCode)}</td>
+      <td class="mono">${esc(it?.code||'—')}</td>
+      <td>${esc(it?.name||'—')}</td>
+      <td style="text-align:right;" class="mono">${fmt(l.qty)} ${esc(it?.unit||'')}</td>
+      <td style="text-align:right;"><button class="btn btn-primary btn-sm" id="print-btn-${idx}" onclick='queuePrintLabel(${idx}, ${JSON.stringify(l).replace(/'/g,"&#39;")})'>🖨 In tem</button></td>
+    </tr>`;
+  }).join('');
+  openModal(`
+    <div class="cond" style="font-weight:700;font-size:15px;margin-bottom:4px;">Đã lưu báo cáo — cuộn vừa tạo</div>
+    <p class="hint" style="margin-bottom:10px;">Chỉ bấm "In tem" cho cuộn đã CHẮC CHẮN là cuộn cuối cùng, sẵn sàng đóng gói — nếu cuộn này còn phải Xẻ băng tiếp thì đừng in ở đây, in sau khi Xẻ băng xong.</p>
+    <div class="table-wrap"><table><thead><tr><th>Mã lô</th><th>Mã hàng</th><th>Tên</th><th style="text-align:right;">Khối lượng</th><th></th></tr></thead><tbody>${rowsHtml}</tbody></table></div>
+    <div style="margin-top:14px;text-align:right;"><button class="btn btn-ghost" onclick="closeModal()">Đóng</button></div>
+  `);
+};
+
+window.queuePrintLabel = async function(idx, lot){
+  const btn = document.getElementById(`print-btn-${idx}`);
+  if (btn) { btn.disabled = true; btn.textContent = 'Đang gửi...'; }
+  try {
+    const it = state.items.find(i=>i.id===lot.itemId);
+    if (!it) throw new Error('Không tìm thấy thông tin mã hàng.');
+    await addDoc(collection(db,'printQueue'), {
+      lotCode: lot.lotCode, itemId: lot.itemId, itemCode: it.code, itemName: it.name,
+      qty: lot.qty, unit: it.unit,
+      numOfDistruptions: PRINT_LABEL_DEFAULTS.numOfDistruptions,
+      workOrder: PRINT_LABEL_DEFAULTS.workOrder,
+      employeeId: PRINT_LABEL_DEFAULTS.employeeId,
+      status: 'pending', createdBy: state.userDoc.email, createdAt: serverTimestamp()
+    });
+    if (btn) { btn.textContent = '✓ Đã gửi lệnh in'; btn.classList.remove('btn-primary'); btn.classList.add('btn-ghost'); }
+    toast(`Đã gửi lệnh in tem cho lô ${lot.lotCode}.`, 'success');
+  } catch(err){
+    if (btn) { btn.disabled = false; btn.textContent = '🖨 In tem'; }
+    toast('Lỗi gửi lệnh in: ' + err.message, 'error');
+  }
+};
+
+/* In lại tem cho 1 lô đã có sẵn (VD tem rách/in lỗi) — dùng ở nơi tra cứu lô theo mã, gọi
+   reprintLabel('<mã lô>') sau khi đã có sẵn doc lô đó trên Firestore. */
+window.reprintLabel = async function(lotCode){
+  try {
+    const snap = await getDoc(doc(db,'lots', lotCode));
+    if (!snap.exists()) return toast(`Không tìm thấy lô ${lotCode}.`, 'error');
+    const lot = snap.data();
+    showPrintOfferPanel([{ lotCode: lot.lotCode, itemId: lot.itemId, qty: lot.stock }]);
+  } catch(err){
+    toast('Lỗi: ' + err.message, 'error');
+  }
+};
+
+
 function renderRework(){
   const candidates = state.items.filter(i=>i.type==='semi'||i.type==='fg'||i.type==='scrap');
   const outputCandidates = rwIsQcReject ? candidates.filter(i=>i.type==='scrap') : candidates;
