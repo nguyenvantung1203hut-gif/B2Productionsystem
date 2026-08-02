@@ -463,13 +463,12 @@ service cloud.firestore {
    Firebase của bạn (Project settings → General → Your apps → SDK setup)
    ====================================================================== */
 const firebaseConfig = {
-  apiKey: "AIzaSyAxAZ00dvRuoOHBrTExGEhYGGRysesDzqw",
-  authDomain: "productionreportv1.firebaseapp.com",
-  projectId: "productionreportv1",
-  storageBucket: "productionreportv1.firebasestorage.app",
-  messagingSenderId: "244661993271",
-  appId: "1:244661993271:web:087de101f701426d6764b2",
-  measurementId: "G-S9SRNJ2YGT"
+  apiKey: "AIzaSyA7VuIA_534QN5sVfOkvUThlPRK2MepG9s",
+  authDomain: "productionrecordv02.firebaseapp.com",
+  projectId: "productionrecordv02",
+  storageBucket: "productionrecordv02.firebasestorage.app",
+  messagingSenderId: "704949014318",
+  appId: "1:704949014318:web:7581eeabd9c758d62eb4bf"
 };
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
@@ -773,6 +772,35 @@ window.deleteTransaction = async function(collectionName, docId, label){
         parentLotSnap = await tx.get(parentLotRef);
       }
 
+      // Đọc trước lô "chưa xác định" cho từng dòng NVL/bán thành phẩm TIÊU THỤ theo BOM (reportData.
+      // consumed) có bật mã lô — để hoàn tác đúng phần đã trừ đi lúc submit (xem consumedLotInfo trong
+      // hàm submit báo cáo sản xuất: mọi tiêu thụ loại này đều trừ vào "lô chưa xác định" của đúng mã
+      // đó, vì hệ thống CHƯA hỗ trợ chọn 1 lô cụ thể cho NVL tiêu thụ theo BOM).
+      // Gộp theo Map (key = lotDocId) để mỗi document CHỈ bị update() đúng 1 lần trong Pha 2 — tránh 2
+      // dòng tiêu thụ khác nhau nhưng cùng mã hàng bị ghi đè lẫn nhau nếu update() nhiều lần trên cùng
+      // 1 document (cùng lý do đã nêu ở đoạn gộp deltaByItem phía trên).
+      const consumedLotQtyByDocId = new Map(); // lotDocId -> tổng actualQty cần cộng trả
+      if (reportData) {
+        for (const c of (reportData.consumed||[])) {
+          const itemSnap = itemSnapMap.get(c.itemId);
+          if (!itemSnap || !itemSnap.exists() || !itemUsesLot(itemSnap.data())) continue;
+          const lotDocId = unknownLotDocId(c.itemId); // TODO: khi hỗ trợ chọn lô cụ thể cho NVL tiêu thụ, đọc lotDocId thật từ report thay vì luôn suy ra "chưa xác định"
+          consumedLotQtyByDocId.set(lotDocId, (consumedLotQtyByDocId.get(lotDocId)||0) + (c.actualQty||0));
+        }
+      }
+      // Trường hợp hiếm: lô "chưa xác định" của 1 dòng tiêu thụ trùng ĐÚNG với lô cha đang hoàn tác ở
+      // trên (parentLotRef, khi lô cha đó cũng là "chưa xác định") — không đọc/update 2 lần trên cùng
+      // document; gộp phần cần cộng trả của dòng tiêu thụ đó vào parentExtraQtyFromConsumed, xử lý
+      // chung 1 lượt ghi duy nhất ở Pha 2.
+      let parentExtraQtyFromConsumed = 0;
+      if (parentLotRef && consumedLotQtyByDocId.has(parentLotRef.id)) {
+        parentExtraQtyFromConsumed = consumedLotQtyByDocId.get(parentLotRef.id);
+        consumedLotQtyByDocId.delete(parentLotRef.id);
+      }
+      const consumedLotRefs = Array.from(consumedLotQtyByDocId.keys()).map(id=>doc(db,'lots',id));
+      const consumedLotSnaps = [];
+      for (const ref of consumedLotRefs) consumedLotSnaps.push(await tx.get(ref));
+
       // Nếu là phiếu xuất kho gắn với 1 lô cụ thể (đã ở Kho thành phẩm) — đọc trước lô đó để hoàn tác
       // tồn + đưa về đúng trạng thái trước khi xuất (active/warehouse), kể cả khi phiếu đó đã xuất hết
       // lô (status/location lúc đó đã bị đổi thành exhausted/shipped).
@@ -782,15 +810,25 @@ window.deleteTransaction = async function(collectionName, docId, label){
         issueLotSnap = await tx.get(issueLotRef);
       }
 
-      // Nếu là phiếu Rework có gắn lô — đọc trước lô đầu vào cụ thể (đã bị trừ) và/hoặc lô "chưa xác
-      // định" của đầu ra (đã được cộng vào) để hoàn tác đúng.
+      // Nếu là phiếu Rework có gắn lô — đọc trước lô liên quan để hoàn tác đúng. 3 trường hợp:
+      // 1) outputLotKept + inputLotDocId===outputLotDocId: lô ĐÃ BỊ ĐỔI TÊN sang mã đầu ra — hoàn tác
+      //    bằng cách đổi tên NGƯỢC lại, không phải cộng/trừ tồn thường (vì đây là CÙNG 1 document).
+      // 2) outputLotKept + outputLotDocId khác inputLotDocId: 1 lô con MỚI đã được tạo riêng cho lần
+      //    rework này — hoàn tác bằng cách XOÁ hẳn lô con đó (giống lô con của báo cáo sản xuất), đồng
+      //    thời cộng trả tồn cho lô cha (đầu vào).
+      // 3) Còn lại (cách cũ / không giữ được số lô): cộng trả lô đầu vào, trừ lô "chưa xác định" đầu ra.
       let reworkInLotRef = null, reworkInLotSnap = null, reworkOutLotRef = null, reworkOutLotSnap = null;
+      let reworkIsRenamedFull = false, reworkIsChildLot = false;
       if (reworkData) {
+        reworkIsRenamedFull = !!(reworkData.outputLotKept && reworkData.inputLotDocId && reworkData.outputLotDocId
+          && reworkData.inputLotDocId === reworkData.outputLotDocId);
+        reworkIsChildLot = !!(reworkData.outputLotKept && !reworkIsRenamedFull && reworkData.outputLotDocId);
         if (reworkData.inputLotDocId) {
           reworkInLotRef = doc(db,'lots', reworkData.inputLotDocId);
           reworkInLotSnap = await tx.get(reworkInLotRef);
         }
-        if (reworkData.outputLotDocId) {
+        // Trường hợp đổi tên: input/output là CÙNG 1 document — chỉ đọc 1 lần ở trên, không đọc lại.
+        if (reworkData.outputLotDocId && !reworkIsRenamedFull) {
           reworkOutLotRef = doc(db,'lots', reworkData.outputLotDocId);
           reworkOutLotSnap = await tx.get(reworkOutLotRef);
         }
@@ -815,12 +853,33 @@ window.deleteTransaction = async function(collectionName, docId, label){
 
       if (parentLotSnap && parentLotSnap.exists()) {
         const p = parentLotSnap.data();
-        const update = { stock: (p.stock||0) + (reportData.parentQty||0), status:'active', updatedAt: serverTimestamp() };
+        // parentExtraQtyFromConsumed: phần cộng trả thêm nếu 1 dòng NVL tiêu thụ trùng lô "chưa xác
+        // định" với lô cha đang hoàn tác ở đây (xem giải thích ở Pha 1) — gộp vào 1 lượt ghi duy nhất.
+        const update = { stock: (p.stock||0) + (reportData.parentQty||0) + parentExtraQtyFromConsumed, status:'active', updatedAt: serverTimestamp() };
         const numChildren = childLotCodes.length; // số lô con đã sinh ra từ báo cáo này, cần trừ lại bộ đếm
-        if (reportData.stage === 'Decoiling' && numChildren>0) update.decoilCount = Math.max(0, (p.decoilCount||0) - numChildren);
-        if (reportData.stage === 'Slitting' && numChildren>0) update.slitCount = Math.max(0, (p.slitCount||0) - numChildren);
+        if (p.isUnknown) {
+          // Lô cha là "Chưa xác định": từ bản vá chống trùng mã, mỗi lần dùng lô này làm cha để Tháo
+          // cuộn/Xẻ băng chỉ tăng `sliceCounter` đúng 1 (không phải decoilCount/slitCount như lô thật)
+          // — xem chi tiết tại nhánh needsParentLot trong hàm submit báo cáo sản xuất. Hoàn tác tương
+          // ứng: giảm sliceCounter đúng 1 nếu báo cáo này thực sự đã sinh ra lô con (numChildren>0).
+          if (numChildren>0) update.sliceCounter = Math.max(0, (p.sliceCounter||0) - 1);
+        } else {
+          if (reportData.stage === 'Decoiling' && numChildren>0) update.decoilCount = Math.max(0, (p.decoilCount||0) - numChildren);
+          if (reportData.stage === 'Slitting' && numChildren>0) update.slitCount = Math.max(0, (p.slitCount||0) - numChildren);
+        }
         tx.update(parentLotRef, update);
       }
+
+      // Hoàn tác lô "chưa xác định" cho các dòng NVL/bán thành phẩm tiêu thụ (đọc sẵn ở Pha 1) — cộng
+      // trả đúng tổng actualQty đã trừ lúc submit. Không đụng tới lô nào trùng với parentLotRef vì đã
+      // được gộp vào update ở trên (parentExtraQtyFromConsumed).
+      consumedLotSnaps.forEach((s, idx) => {
+        if (!s.exists()) return; // lô đã bị xoá thủ công sau đó — không có gì để hoàn tác
+        const ref = consumedLotRefs[idx];
+        const qty = consumedLotQtyByDocId.get(ref.id) || 0;
+        const d = s.data();
+        tx.update(ref, { stock: (d.stock||0) + qty, status:'active', updatedAt: serverTimestamp() });
+      });
 
       if (issueLotSnap && issueLotSnap.exists()) {
         const l = issueLotSnap.data();
@@ -830,13 +889,31 @@ window.deleteTransaction = async function(collectionName, docId, label){
         });
       }
 
-      if (reworkInLotSnap && reworkInLotSnap.exists()) {
+      if (reworkIsRenamedFull && reworkInLotSnap && reworkInLotSnap.exists()) {
+        // Hoàn tác đổi tên: trả lô về đúng mã đầu vào ban đầu với đúng tồn lúc đó (1 lượt ghi duy
+        // nhất, vì đây là cùng 1 document đã đóng vai trò cả "lô vào" lẫn "lô ra").
         const l = reworkInLotSnap.data();
-        tx.update(reworkInLotRef, { stock: (l.stock||0) + reworkData.inputQty, status:'active', updatedAt: serverTimestamp() });
-      }
-      if (reworkOutLotSnap && reworkOutLotSnap.exists()) {
-        const l = reworkOutLotSnap.data();
-        tx.update(reworkOutLotRef, { stock: (l.stock||0) - reworkData.outputQty, updatedAt: serverTimestamp() });
+        tx.update(reworkInLotRef, {
+          itemId: reworkData.inputItemId, stock: reworkData.inputQty, status: 'active',
+          reworkCount: Math.max(0, (l.reworkCount||0) - 1), reworkedFrom: null, updatedAt: serverTimestamp()
+        });
+      } else {
+        if (reworkInLotSnap && reworkInLotSnap.exists()) {
+          const l = reworkInLotSnap.data();
+          tx.update(reworkInLotRef, {
+            stock: (l.stock||0) + reworkData.inputQty, status: 'active',
+            ...(reworkIsChildLot ? { reworkCount: Math.max(0, (l.reworkCount||0) - 1) } : {}),
+            updatedAt: serverTimestamp()
+          });
+        }
+        if (reworkIsChildLot) {
+          // Lô con được tạo riêng cho lần rework này — xoá hẳn khi hoàn tác (giống lô con sinh ra từ
+          // báo cáo sản xuất), không để lại document rỗng.
+          if (reworkOutLotSnap && reworkOutLotSnap.exists()) tx.delete(reworkOutLotRef);
+        } else if (reworkOutLotSnap && reworkOutLotSnap.exists()) {
+          const l = reworkOutLotSnap.data();
+          tx.update(reworkOutLotRef, { stock: (l.stock||0) - reworkData.outputQty, updatedAt: serverTimestamp() });
+        }
       }
       if (receiptLotSnap && receiptLotSnap.exists()) {
         const l = receiptLotSnap.data();
@@ -1039,12 +1116,23 @@ window.openEditProduction = function(id){
   // Báo cáo có sinh/tiêu thụ mã lô (Casting/Decoiling/Slitting) — không cho sửa số lượng vì sẽ làm
   // lệch tồn kho theo lô (lots) khỏi item.stock. Chỉ cho sửa ngày/ghi chú; cần đổi số lượng thì xoá
   // và tạo lại báo cáo (khi đó lots sẽ được hoàn tác/sinh lại đúng qua deleteTransaction).
-  const hasLot = !!r.outputLotCode || secondaryOutputs.some(s=>s.lotCode) || !!r.parentItemId;
+  // consumedHasLot: NGOÀI lô đầu ra/lô cha, còn phải kiểm tra CẢ các dòng NVL/bán thành phẩm TIÊU THỤ
+  // theo BOM — vì các dòng này (nếu mã có bật mã lô) cũng bị trừ vào "lô chưa xác định" tương ứng lúc
+  // submit (xem consumedLotInfo trong hàm submit báo cáo sản xuất). Nếu vẫn cho sửa số lượng tự do ở
+  // đây (nhánh saveEditProduction chỉ đụng item.stock, KHÔNG đụng tới lots), tồn của lô "chưa xác định"
+  // sẽ lệch khỏi item.stock — đúng kiểu lỗi lệch mà cơ chế "chỉ-sửa-ngày/ghi-chú" này được tạo ra để
+  // ngăn.
+  const consumedHasLot = (r.consumed||[]).some(c => itemUsesLot(state.items.find(i=>i.id===c.itemId)));
+  const hasLot = !!r.outputLotCode || secondaryOutputs.some(s=>s.lotCode) || !!r.parentItemId || consumedHasLot;
 
   if (hasLot) {
+    const lotReasonParts = [];
+    if (r.outputLotCode) lotReasonParts.push(`lô đầu ra ${esc(r.outputLotCode)}`);
+    if (r.parentItemId) lotReasonParts.push(`lô cha ${r.parentLotCode?esc(r.parentLotCode):'chưa xác định'}`);
+    if (consumedHasLot) lotReasonParts.push('NVL/bán thành phẩm tiêu thụ có dùng mã lô');
     openModal(`
       <div class="cond" style="font-weight:700;font-size:15px;margin-bottom:14px;">Sửa báo cáo sản xuất — ${r.stage}</div>
-      <p class="hint" style="color:var(--amber-600);">Báo cáo này có liên quan đến mã lô truy xuất (${r.outputLotCode?esc(r.outputLotCode):'lô đầu ra'}${r.parentItemId?` / lô cha ${r.parentLotCode?esc(r.parentLotCode):'chưa xác định'}`:''}) nên không thể sửa số lượng ở đây — việc này sẽ làm lệch tồn kho theo lô. Nếu cần đổi số lượng, hãy <b>xoá báo cáo này rồi tạo lại</b> (tồn kho và các lô liên quan sẽ được hoàn tác đúng). Bạn chỉ có thể sửa ngày và ghi chú bên dưới.</p>
+      <p class="hint" style="color:var(--amber-600);">Báo cáo này có liên quan đến mã lô truy xuất (${lotReasonParts.join(' / ')}) nên không thể sửa số lượng ở đây — việc này sẽ làm lệch tồn kho theo lô. Nếu cần đổi số lượng, hãy <b>xoá báo cáo này rồi tạo lại</b> (tồn kho và các lô liên quan sẽ được hoàn tác đúng). Bạn chỉ có thể sửa ngày và ghi chú bên dưới.</p>
       <div class="field"><label>Ngày sản xuất</label><input type="date" id="edit-prod-date" value="${r.date}"></div>
       <div class="field"><label>Ghi chú</label><input type="text" id="edit-prod-note" value="${esc(r.note)}"></div>
       <div style="display:flex;gap:8px;margin-top:8px;">
@@ -1293,10 +1381,10 @@ function boot(){
   });
 }
 
+
 function hideAllScreens(){
   ['setup-screen','auth-screen','pending-screen','app-shell'].forEach(id=>document.getElementById(id).classList.add('hidden'));
 }
-
 function routeByStatus(){
   hideAllScreens();
   const ud = state.userDoc;
@@ -1396,7 +1484,7 @@ function renderTab(tab, resetForm){
     case 'warehouse':  if(resetForm || !c.querySelector('#wh-search')){ c.innerHTML = renderWarehouse(); loadWarehouseLots(); } break;
     case 'issue':      if(resetForm || !c.querySelector('#iss-item')){ c.innerHTML = renderIssue(); enhanceCombosIn(c); } break;
     case 'rework':     if(resetForm || !c.querySelector('#rw-input')){ c.innerHTML = renderRework(); enhanceCombosIn(c); } break;
-    case 'report':     if(resetForm || !c.querySelector('#report-month')){ c.innerHTML = renderReport(); setTimeout(()=>generateReport(),0); } break;
+    case 'report':     if(resetForm || !c.querySelector('#report-from')){ c.innerHTML = renderReport(); setTimeout(()=>generateReport(),0); } break;
     case 'items':       if(resetForm || !c.querySelector('#items-search')){ c.innerHTML = renderItems(); } renderItemsTable(); break;
     case 'bom':         if(resetForm || !c.querySelector('#bom-output')){ c.innerHTML = renderBom(); enhanceCombosIn(c); } break;
     case 'history':      if(resetForm || !c.querySelector('#hist-from')){ c.innerHTML = renderHistory(); searchHistory(); } break;
@@ -1436,14 +1524,28 @@ function itemUnit(id){ const it = state.items.find(i=>i.id===id); return it ? es
      EF = số luỹ kế các dải sinh ra từ 1 lần Xẻ băng trên ĐÚNG lô cha (đã tháo cuộn) đó (00 = chưa xẻ băng)
    Lô có nguồn gốc không rõ (tồn kho cũ trước khi có mã lô, hoặc phát sinh từ Xuất kho/Điều chỉnh/Rework
    không chỉ định lô) được gộp vào 1 "lô ảo" riêng cho từng mã sản phẩm, doc id cố định UNKNOWN_<itemId>,
-   có dateSeg/xyzSeg/ab = '000000'/'000'/'00' để mọi lô con sinh ra từ nó (nếu sau này được Tháo cuộn/
-   Xẻ băng) vẫn có mã hợp lệ, dễ nhận biết là "gốc không rõ" nhờ tiền tố 000000-000.
+   có dateSeg/xyzSeg = '000000'/'000' để mọi lô con sinh ra từ nó (nếu sau này được Tháo cuộn/Xẻ băng)
+   vẫn có mã hợp lệ, dễ nhận biết là "gốc không rõ" nhờ tiền tố 000000-000.
+   QUAN TRỌNG (chống trùng mã): vì lô ảo này dùng CHUNG 1 document cho cả mã sản phẩm, AB KHÔNG cố định
+   '00' như lô Casting thật — mỗi LẦN lô ảo được chọn làm lô cha để Tháo cuộn/Xẻ băng sẽ được cấp 1 số
+   thứ tự AB MỚI (field `sliceCounter` trên chính document lô ảo, tăng 1 mỗi lần "checkout", tối đa 99
+   lần/mã hàng). Nhờ vậy CD/EF của mỗi lần dùng luôn an toàn khi bắt đầu lại từ 00, vì gắn với 1 AB
+   riêng — không còn chia sẻ bộ đếm CD/EF chung giữa các lần dùng khác nhau như thiết kế cũ (đã gây lỗi
+   sinh trùng mã lô con khi lô ảo được dùng nhiều lần). Xem chi tiết cách tính tại nhánh
+   `needsParentLot` trong hàm submit báo cáo sản xuất (biến `parentLotPlan`).
 --------------------------------------------------------------------- */
 const LOT_STAGES = ['Casting', 'Decoiling', 'Slitting'];
 function itemUsesLot(item){
   return !!item && (item.type==='semi' || item.type==='fg') && item.usesLot !== false;
 }
 function pad2(n){ return String(n).padStart(2,'0'); }
+function pad3(n){ return String(n).padStart(3,'0'); }
+// xyzSeg thật của Casting luôn có chữ số ĐẦU là 5 hoặc 6 (lò luyện). Mọi giá trị có chữ số đầu KHÁC
+// 5/6 chắc chắn không bao giờ trùng với xyzSeg thật -> dùng dải này để cấp riêng cho từng mã hàng khi
+// cần sinh mã lô con từ "lô Chưa xác định" (xem UNKNOWN_LOT_XYZ_COUNTER_DOC_ID bên dưới).
+function isSafeUnknownXyz(n){ const first = Math.floor(n/100); return first !== 5 && first !== 6; }
+function nextSafeUnknownXyz(startFrom){ let n = Math.max(0, startFrom|0); while (!isSafeUnknownXyz(n)) n++; return n; }
+const UNKNOWN_LOT_XYZ_COUNTER_REF = () => doc(db,'counters','unknownLotXyz');
 function dateToYYMMDD(dateStr){ // "2026-07-07" -> "260707"
   const [y,m,d] = dateStr.split('-');
   return y.slice(2) + m + d;
@@ -1633,7 +1735,14 @@ window.loadWarehouseLots = async function(){
       getDocs(query(collection(db,'lots'), where('isUnknown','==',true)))
     ]);
     const whLots = whSnap.docs.map(d=>({ id:d.id, ...d.data() }));
-    const unkLots = unkSnap.docs.map(d=>({ id:d.id, ...d.data() })).filter(l=>(l.stock||0)>0);
+    // Chỉ giữ lại lô "chưa xác định" của những mã HIỆN TẠI vẫn đang bật mã lô (itemUsesLot). Khi 1 mã
+    // đã từng bật mã lô rồi bị tắt đi (toggleItemUsesLot) hoặc đổi Loại sang Nguyên liệu/Phế phẩm, hệ
+    // thống CHỦ Ý giữ lại document "chưa xác định" cũ (để không mất lịch sử) nhưng KHÔNG còn cập nhật
+    // nó nữa — nếu không lọc theo usesLot ở đây, các mã KHÔNG kiểm soát lô sẽ bị liệt kê nhầm vào Kho
+    // thành phẩm cùng nhãn "Chưa xác định / Tồn kho cũ", dù mã đó không còn thuộc phạm vi quản lý theo
+    // lô nữa (tổng tồn kho thật của mã này đã nằm trọn trong item.stock, không liên quan gì tới lô này).
+    const unkLots = unkSnap.docs.map(d=>({ id:d.id, ...d.data() }))
+      .filter(l=>(l.stock||0)>0 && itemUsesLot(state.items.find(i=>i.id===l.itemId)));
     warehouseLotsCache = whLots.concat(unkLots);
     filterWarehouseLots();
   } catch(err){
@@ -1697,7 +1806,7 @@ window.filterWarehouseLots = function(){
         <tr id="${gid}" class="${expanded?'':'hidden'}">
           <td colspan="5" style="padding:0;">
             <div style="padding:6px 8px 10px 32px;">
-              <table><thead><tr><th>Mã lô</th><th>Công đoạn tạo</th><th style="text-align:right;">Tồn</th><th>Ngày đóng gói</th><th>Người đóng gói</th></tr></thead><tbody>
+              <table><thead><tr><th>Mã lô</th><th>Công đoạn tạo</th><th style="text-align:right;">Tồn</th><th>Ngày đóng gói</th><th>Người đóng gói</th><th></th></tr></thead><tbody>
                 ${lotsSorted.map(l=>`
                   <tr>
                     <td class="mono">${l.isUnknown? '<span class="hint">Chưa xác định</span>' : (l.lotCode?esc(l.lotCode):'—')}</td>
@@ -1705,6 +1814,7 @@ window.filterWarehouseLots = function(){
                     <td style="text-align:right;" class="mono">${fmt(l.stock)} ${itemUnit(l.itemId)}</td>
                     <td class="mono">${l.packedAt?.toDate ? l.packedAt.toDate().toLocaleString('vi-VN') : '—'}</td>
                     <td>${l.packedBy?esc(l.packedBy):'—'}</td>
+                    <td style="text-align:right;">${l.isUnknown ? '' : `<button class="btn btn-ghost btn-sm" onclick="reprintLabel('${esc(l.lotCode)}')" title="In lại tem cho lô này (VD tem rách/mất)">🖨 In lại tem</button>`}</td>
                   </tr>`).join('')}
               </tbody></table>
             </div>
@@ -2797,24 +2907,83 @@ window.submitIssue = async function(btn){
 };
 
 /* ---------------------------------------------------------------------
-   BÁO CÁO TỒN KHO (theo tháng) — tồn đầu kỳ / nhập / xuất / tồn cuối kỳ
+   BÁO CÁO TỒN KHO (theo giai đoạn tùy chỉnh) — tồn đầu kỳ / nhập / xuất / tồn cuối kỳ
+   Giai đoạn được chọn tự do qua 2 ô "Từ ngày"/"Đến ngày". Các nút chọn nhanh chỉ để
+   TIỆN ĐIỀN sẵn 2 ô ngày đó — không tự chạy báo cáo, người dùng vẫn bấm "Tạo báo cáo".
 --------------------------------------------------------------------- */
+function ymd(d){ return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
+function fmtDateVN(ymdStr){ const [y,m,d] = ymdStr.split('-'); return `${d}/${m}/${y}`; } // "YYYY-MM-DD" -> "dd/mm/yyyy"
+function lastDayOfMonth(y, mIdx0){ return new Date(y, mIdx0+1, 0).getDate(); } // mIdx0: tháng 0-based
+
+/* Tính sẵn khoảng ngày cho từng nút chọn nhanh, dựa trên ngày hôm nay. */
+function reportPresetRange(preset){
+  const now = new Date();
+  const y = now.getFullYear(), mIdx = now.getMonth(); // mIdx: 0-based
+  switch(preset){
+    case 'thisMonth': {
+      const from = new Date(y, mIdx, 1), to = new Date(y, mIdx, lastDayOfMonth(y, mIdx));
+      return { from: ymd(from), to: ymd(to) };
+    }
+    case 'lastMonth': {
+      const lm = mIdx===0 ? 11 : mIdx-1, ly = mIdx===0 ? y-1 : y;
+      const from = new Date(ly, lm, 1), to = new Date(ly, lm, lastDayOfMonth(ly, lm));
+      return { from: ymd(from), to: ymd(to) };
+    }
+    case 'thisQuarter': {
+      const qStartMonth = Math.floor(mIdx/3)*3;
+      const from = new Date(y, qStartMonth, 1), to = new Date(y, qStartMonth+2, lastDayOfMonth(y, qStartMonth+2));
+      return { from: ymd(from), to: ymd(to) };
+    }
+    case 'thisYear': {
+      return { from: ymd(new Date(y,0,1)), to: ymd(new Date(y,11,31)) };
+    }
+    case 'last7': {
+      const to = new Date(now), from = new Date(now); from.setDate(from.getDate()-6);
+      return { from: ymd(from), to: ymd(to) };
+    }
+    case 'last30': {
+      const to = new Date(now), from = new Date(now); from.setDate(from.getDate()-29);
+      return { from: ymd(from), to: ymd(to) };
+    }
+    default: return null;
+  }
+}
+window.applyReportPreset = function(preset){
+  const r = reportPresetRange(preset);
+  if (!r) return;
+  document.getElementById('report-from').value = r.from;
+  document.getElementById('report-to').value = r.to;
+};
+
 function renderReport(){
-  const defaultMonth = new Date().toISOString().slice(0,7);
+  const def = reportPresetRange('thisMonth'); // mặc định khi mở tab: trọn tháng hiện tại (giữ hành vi cũ)
   return `
   <div class="card">
     <div class="field-row" style="align-items:flex-end;">
-      <div class="field" style="max-width:220px;">
-        <label>Chọn tháng báo cáo</label>
-        <input type="month" id="report-month" value="${defaultMonth}">
+      <div class="field" style="max-width:170px;">
+        <label>Từ ngày</label>
+        <input type="date" id="report-from" value="${def.from}">
       </div>
       <div class="field" style="max-width:170px;">
+        <label>Đến ngày</label>
+        <input type="date" id="report-to" value="${def.to}">
+      </div>
+      <div class="field" style="max-width:150px;">
         <button class="btn btn-primary btn-block" onclick="generateReport()">Tạo báo cáo</button>
       </div>
       <div class="field" style="max-width:170px;">
         <button class="btn btn-ghost btn-block" id="report-export-btn" onclick="exportReportExcel()" disabled>Xuất Excel (.xlsx)</button>
       </div>
     </div>
+    <div class="field-row" style="margin-top:2px;">
+      <button class="btn btn-ghost btn-sm" onclick="applyReportPreset('thisMonth')">Tháng này</button>
+      <button class="btn btn-ghost btn-sm" onclick="applyReportPreset('lastMonth')">Tháng trước</button>
+      <button class="btn btn-ghost btn-sm" onclick="applyReportPreset('thisQuarter')">Quý này</button>
+      <button class="btn btn-ghost btn-sm" onclick="applyReportPreset('thisYear')">Năm nay</button>
+      <button class="btn btn-ghost btn-sm" onclick="applyReportPreset('last7')">7 ngày qua</button>
+      <button class="btn btn-ghost btn-sm" onclick="applyReportPreset('last30')">30 ngày qua</button>
+    </div>
+    <p class="hint" style="margin-top:8px;">Các nút trên chỉ điền sẵn 2 ô ngày — bạn có thể sửa tay 2 ô này thành bất kỳ giai đoạn nào rồi bấm <b>Tạo báo cáo</b>.</p>
     <p class="hint">
       <b>Nhập từ ngoài:</b> phiếu nhập nguyên liệu &nbsp;·&nbsp;
       <b>Nội bộ — Tăng:</b> thành phẩm/bán thành phẩm/hàng hỏng được tạo ra từ sản xuất/Rework &nbsp;·&nbsp;
@@ -2836,42 +3005,42 @@ function classifyLedgerType(type){
 }
 
 window.generateReport = async function(){
-  const monthVal = document.getElementById('report-month').value; // "YYYY-MM"
-  if (!monthVal) return toast('Vui lòng chọn tháng.', 'error');
-  const [y,m] = monthVal.split('-').map(Number);
-  const startStr = monthVal + '-01';
-  const lastDay = new Date(y, m, 0).getDate();
-  const endStr = monthVal + '-' + String(lastDay).padStart(2,'0');
+  const startStr = document.getElementById('report-from').value; // "YYYY-MM-DD"
+  const endStr = document.getElementById('report-to').value;     // "YYYY-MM-DD"
+  if (!startStr || !endStr) return toast('Vui lòng chọn đủ Từ ngày và Đến ngày.', 'error');
+  if (startStr > endStr) return toast('"Từ ngày" phải nhỏ hơn hoặc bằng "Đến ngày".', 'error');
+
+  // Nếu giai đoạn chọn đúng là TRỌN 1 THÁNG DƯƠNG LỊCH (ngày 1 → ngày cuối cùng của cùng tháng đó),
+  // ta coi đây là "báo cáo tháng" như cơ chế cũ — được phép đọc/ghi cache monthlyClosingSnapshots.
+  // Giai đoạn tùy chỉnh khác (lẻ ngày, nhiều tháng, quý, năm...) KHÔNG ghi cache mới (tránh tạo snapshot
+  // rác cho các khoảng ít khi lặp lại) nhưng VẪN tận dụng được các snapshot tháng đã có sẵn làm baseline.
+  const [sy,sm,sd] = startStr.split('-').map(Number);
+  const isFullMonth = sd===1 && endStr === (startStr.slice(0,7) + '-' + String(lastDayOfMonth(sy, sm-1)).padStart(2,'0'));
 
   const resultEl = document.getElementById('report-result');
   resultEl.innerHTML = '<div class="card"><p class="hint">Đang tính toán...</p></div>';
 
   try {
-    // Tìm snapshot "tồn cuối kỳ" gần nhất của một tháng TRƯỚC tháng đang xem (nếu có).
-    // Nhờ đó chỉ cần quét các dòng ledger PHÁT SINH SAU mốc snapshot đó, thay vì quét
-    // toàn bộ lịch sử từ ngày đầu tiên vận hành — càng vận hành lâu càng tiết kiệm.
-    let openingClosingMap = {};
-    let scanFromDate = null; // null = chưa có snapshot nào trước đó, phải quét từ đầu
-    const snapQ = await getDocs(query(
-      collection(db,'monthlyClosingSnapshots'),
-      where('month','<', monthVal), orderBy('month','desc'), limit(1)
-    ));
-    if (!snapQ.empty) {
-      const cached = snapQ.docs[0].data();
-      openingClosingMap = cached.closing || {};
-      scanFromDate = cached.endDate;
-    }
-
-    const ledgerQuery = scanFromDate
-      ? query(collection(db,'stockLedger'), where('date','>', scanFromDate), where('date','<=', endStr))
-      : query(collection(db,'stockLedger'), where('date','<=', endStr));
+    // ĐÃ BỎ HOÀN TOÀN cơ chế đọc/ghi cache "monthlyClosingSnapshots" để tính Tồn đầu kỳ.
+    // Lý do: cache đó lưu số dư CUỐI kỳ của tháng trước (đã bao gồm phát sinh của chính tháng đó),
+    // và nếu cache bị lỗi thời (invalidateSnapshotsFrom chạy bất đồng bộ nên có thể chưa kịp xoá,
+    // hoặc thiếu chỉ mục Firestore khiến việc xoá/đọc thất bại âm thầm), báo cáo sẽ NẠP NHẦM số dư
+    // đã bao gồm sản lượng phát sinh trong tháng làm Tồn đầu kỳ, khiến sản lượng bị cộng dồn 2 lần.
+    // Cách khắc phục: luôn tính trực tiếp từ sổ cái gốc (stockLedger) — nguồn dữ liệu duy nhất đáng
+    // tin cậy — mỗi lần tạo báo cáo, không phụ thuộc bất kỳ bản ghi cache trung gian nào nữa.
+    const ledgerQuery = query(collection(db,'stockLedger'), where('date','<=', endStr));
     const snap = await getDocs(ledgerQuery);
     const entries = snap.docs.map(d=>d.data());
 
-    const closingMap = { ...openingClosingMap }, extInMap = {}, extOutMap = {}, internalInMap = {}, internalOutMap = {}, adjustMap = {};
+    // Tách chính xác 2 khoảng thời gian:
+    //  - entryDate < startStr  → cộng dồn TOÀN BỘ biến động trước giai đoạn báo cáo để ra Tồn đầu kỳ.
+    //  - startStr <= entryDate <= endStr → phân loại vào các cột phát sinh trong kỳ.
+    const openingMap = {}, extInMap = {}, extOutMap = {}, internalInMap = {}, internalOutMap = {}, adjustMap = {};
     entries.forEach(e=>{
-      closingMap[e.itemId] = (closingMap[e.itemId]||0) + e.delta;
-      if (e.date >= startStr && e.date <= endStr) {
+      if (e.date < startStr) {
+        openingMap[e.itemId] = (openingMap[e.itemId]||0) + e.delta;
+      } else {
+        // e.date chắc chắn <= endStr nhờ điều kiện truy vấn, và >= startStr nhờ nhánh else này.
         const cat = classifyLedgerType(e.type);
         if (cat==='extIn') extInMap[e.itemId] = (extInMap[e.itemId]||0) + e.delta;
         else if (cat==='extOut') extOutMap[e.itemId] = (extOutMap[e.itemId]||0) + e.delta;
@@ -2887,21 +3056,23 @@ window.generateReport = async function(){
     });
 
     // Làm tròn về 6 chữ số thập phân để loại bỏ "nhiễu" của số thực dấu phẩy động (floating-point) —
-    // VD 0.1+0.2 trong JS ra 0.30000000000000004, và sau hàng trăm phép cộng/trừ nối tiếp (nhất là khi
-    // tính Tồn đầu kỳ bằng cách LẤY Tồn cuối kỳ TRỪ NGƯỢC lại các phát sinh trong tháng), sai số cộng
+    // VD 0.1+0.2 trong JS ra 0.30000000000000004, và sau hàng trăm phép cộng/trừ nối tiếp, sai số cộng
     // dồn có thể lộ ra thành các số cực nhỏ kiểu -1.78E-15 thay vì đúng 0. Trên màn hình không thấy vì
     // hàm fmt() hiển thị đã tự làm tròn 3 số thập phân, nhưng khi xuất CSV lại ghi thẳng số gốc chưa
     // làm tròn nên bị lộ ra dạng khoa học (E-15) khi mở bằng Excel. 6 số thập phân là đủ dư so với độ
     // chính xác thực tế cần dùng (kg/cuộn), nên làm tròn ở đây không làm mất số liệu thật nào.
     const roundQty = v => Math.round((v + Number.EPSILON) * 1e6) / 1e6;
+    // Công thức: Tồn cuối kỳ = Tồn đầu kỳ + Nhập ngoài + Nội bộ Tăng + Nội bộ Giảm + Xuất ngoài + Điều chỉnh
+    // (Tồn đầu kỳ giờ lấy trực tiếp từ openingMap — tổng phát sinh TRƯỚC startStr — không còn suy ngược
+    // từ 1 số dư cuối kỳ đọc từ cache, nên không còn rủi ro cộng dồn 2 lần khi cache lỗi thời.)
     const rows = state.items.map(it=>{
-      const closing = closingMap[it.id] || 0;
+      const opening = openingMap[it.id] || 0;
       const extIn = extInMap[it.id] || 0;
       const extOut = extOutMap[it.id] || 0;
       const internalIn = internalInMap[it.id] || 0;
       const internalOut = internalOutMap[it.id] || 0;
       const adjust = adjustMap[it.id] || 0;
-      const opening = closing - (extIn + extOut + internalIn + internalOut + adjust);
+      const closing = opening + extIn + extOut + internalIn + internalOut + adjust;
       return {
         ...it,
         opening: roundQty(opening), extIn: roundQty(extIn), extOut: roundQty(extOut),
@@ -2918,20 +3089,16 @@ window.generateReport = async function(){
       return (a.code||'').localeCompare(b.code||'', 'vi', { numeric: true, sensitivity: 'base' });
     });
     window._lastReportRows = rows;
-    window._lastReportMonth = monthVal;
+    window._lastReportPeriod = { from: startStr, to: endStr };
     document.getElementById('report-export-btn').disabled = rows.length===0;
 
-    // Lưu lại snapshot tồn cuối kỳ của CHÍNH tháng này để các lần tạo báo cáo cho tháng này
-    // trở đi (tháng sau, tháng sau nữa...) không phải quét lại từ đầu. Chạy nền, không chặn UI.
-    const closingSnapshotMap = {};
-    state.items.forEach(it => { closingSnapshotMap[it.id] = closingMap[it.id] || 0; });
-    setDoc(doc(db,'monthlyClosingSnapshots', monthVal), {
-      month: monthVal, endDate: endStr, closing: closingSnapshotMap, computedAt: serverTimestamp()
-    }).catch(err => console.error('Không lưu được cache báo cáo tháng này (không ảnh hưởng số liệu hiển thị):', err));
+    // KHÔNG còn ghi cache "monthlyClosingSnapshots" nữa — báo cáo giờ luôn tính trực tiếp từ
+    // stockLedger nên không cần (và không nên) lưu lại số dư trung gian có thể trở nên lỗi thời.
 
+    const periodLabel = isFullMonth ? `tháng ${sm}/${sy}` : `từ ${fmtDateVN(startStr)} đến ${fmtDateVN(endStr)}`;
     resultEl.innerHTML = `
     <div class="card">
-      <div class="cond" style="font-weight:700;font-size:15px;margin-bottom:10px;">Báo cáo tồn kho tháng ${m}/${y}</div>
+      <div class="cond" style="font-weight:700;font-size:15px;margin-bottom:10px;">Báo cáo tồn kho ${periodLabel}</div>
       ${rows.length? `<div class="table-wrap"><table><thead><tr>
         <th>Mã</th><th>Tên</th><th>Loại</th><th>ĐVT</th>
         <th style="text-align:right;">Tồn đầu kỳ</th>
@@ -2966,10 +3133,11 @@ window.exportReportExcel = function(){
   const rows = window._lastReportRows || [];
   if (!rows.length) return;
   if (typeof XLSX === 'undefined') return toast('Không tải được thư viện xuất Excel — kiểm tra lại kết nối mạng rồi thử lại.', 'error');
-  const monthVal = window._lastReportMonth || '';
+  const period = window._lastReportPeriod || { from:'', to:'' };
+  const periodLabel = `từ ${period.from ? fmtDateVN(period.from) : '—'} đến ${period.to ? fmtDateVN(period.to) : '—'}`;
   const header = ['Mã','Tên','Loại','ĐVT','Tồn đầu kỳ','Nhập từ ngoài','Nội bộ - Tăng (SX/Rework)','Nội bộ - Giảm (SX/Rework)','Xuất ra ngoài','Điều chỉnh kiểm kê','Tồn cuối kỳ'];
   const aoa = [
-    [`Báo cáo tồn kho tháng ${monthVal}`],
+    [`Báo cáo tồn kho ${periodLabel}`],
     [],
     header,
     ...rows.map(r=>[r.code||'', r.name||'', TYPE_LABEL[r.type], r.unit, r.opening, r.extIn, r.internalIn, r.internalOut, r.extOut, r.adjust, r.closing]),
@@ -2990,7 +3158,7 @@ window.exportReportExcel = function(){
   });
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Bao cao ton kho');
-  XLSX.writeFile(wb, `bao-cao-ton-kho-${monthVal}.xlsx`);
+  XLSX.writeFile(wb, `bao-cao-ton-kho-${period.from||'tu'}_${period.to||'den'}.xlsx`);
 };
 
 /* ---------------------------------------------------------------------
@@ -3187,14 +3355,15 @@ window.onProdParentLotChange = function(){
   const lot = lots.find(l=>l.id===lotDocId);
   const infoEl = document.getElementById('prod-parent-lot-info');
   if (!lot) { prodParentLot = null; if (infoEl) infoEl.textContent=''; renderProdBalance(); return; }
+  const reprintBtn = (!lot.isUnknown && lot.lotCode) ? ` <button class="btn btn-ghost btn-sm" onclick="reprintLabel('${esc(lot.lotCode)}')" title="In lại tem cho lô này (VD tem rách/mất, hoặc in lại cho phần còn dư từ lần xẻ trước)">🖨 In lại tem cho lô này</button>` : '';
   if (prodSelectedStage === 'Decoiling') {
     prodParentLot = { itemId: lot.itemId, lotDocId: lot.id, lotCode: lot.lotCode, isUnknown: !!lot.isUnknown, stock: lot.stock, qty: lot.stock };
-    if (infoEl) infoEl.textContent = `Sẽ tiêu thụ toàn bộ ${fmt(lot.stock)} ${itemUnit(lot.itemId)} của lô này (Tháo cuộn luôn dùng hết 1 lô).`;
+    if (infoEl) infoEl.innerHTML = `Sẽ tiêu thụ toàn bộ ${fmt(lot.stock)} ${itemUnit(lot.itemId)} của lô này (Tháo cuộn luôn dùng hết 1 lô).${reprintBtn}`;
   } else {
     prodParentLot = { itemId: lot.itemId, lotDocId: lot.id, lotCode: lot.lotCode, isUnknown: !!lot.isUnknown, stock: lot.stock, qty: 0 };
     const qtyInput = document.getElementById('prod-parent-qty');
     if (qtyInput) qtyInput.value = '';
-    if (infoEl) infoEl.textContent = `Tồn lô này: ${fmt(lot.stock)} ${itemUnit(lot.itemId)}.`;
+    if (infoEl) infoEl.innerHTML = `Tồn lô này: ${fmt(lot.stock)} ${itemUnit(lot.itemId)}.${reprintBtn}`;
   }
   renderProdBalance();
 };
@@ -3205,10 +3374,11 @@ window.onProdParentQtyChange = function(){
   prodParentLot.qty = v || 0;
   const infoEl = document.getElementById('prod-parent-lot-info');
   if (infoEl) {
+    const reprintBtn = (!prodParentLot.isUnknown && prodParentLot.lotCode) ? ` <button class="btn btn-ghost btn-sm" onclick="reprintLabel('${esc(prodParentLot.lotCode)}')" title="In lại tem cho lô này (VD tem rách/mất, hoặc in lại cho phần còn dư từ lần xẻ trước)">🖨 In lại tem cho lô này</button>` : '';
     if (prodParentLot.qty > prodParentLot.stock + 0.0001) {
-      infoEl.innerHTML = `<span style="color:var(--danger-600);">Vượt quá tồn kho của lô (${fmt(prodParentLot.stock)} ${itemUnit(prodParentLot.itemId)}).</span>`;
+      infoEl.innerHTML = `<span style="color:var(--danger-600);">Vượt quá tồn kho của lô (${fmt(prodParentLot.stock)} ${itemUnit(prodParentLot.itemId)}).</span>${reprintBtn}`;
     } else {
-      infoEl.textContent = `Còn lại sau khi xẻ băng: ${fmt(prodParentLot.stock - prodParentLot.qty)} ${itemUnit(prodParentLot.itemId)}.`;
+      infoEl.innerHTML = `Còn lại sau khi xẻ băng: ${fmt(prodParentLot.stock - prodParentLot.qty)} ${itemUnit(prodParentLot.itemId)}.${reprintBtn}`;
     }
   }
   renderProdBalance();
@@ -3524,6 +3694,7 @@ window.submitProduction = async function(btn){
 
   let mainLotCode = null;
   let secLotCodes = [];
+  let parentRemainingStock = null; // tồn còn lại của lô cha sau khi trừ — dùng để mở lại panel in tem cho phần dư (VD xẻ băng dở cuộn)
   const parentSel = needsParentLot ? { ...prodParentLot } : null; // chốt lại lựa chọn tại thời điểm bấm Lưu
 
   try {
@@ -3567,6 +3738,7 @@ window.submitProduction = async function(btn){
       const secUnknownLotInfo = new Array(secondaryOutputs.length).fill(null);
       let parentLotSnap = null;
       let castingLotPlan = null; // { dateSeg, xyzSeg, mainCode, secCodesPlanned } — tính trước để kiểm tra trùng mã
+      let parentLotPlan = null; // { ...xem bên dưới... } — tính trước mã lô con cho Decoiling/Slitting, kiểm tra trùng mã trong PHA 1
 
       if (prodSelectedStage === 'Casting') {
         if (mainNeedsLot || secNeedsLot.some(Boolean)) {
@@ -3594,6 +3766,64 @@ window.submitProduction = async function(btn){
       } else if (needsParentLot) {
         parentLotSnap = await tx.get(doc(db,'lots', parentSel.lotDocId));
         if (!parentLotSnap.exists()) throw new Error('Lô cha đã chọn không còn tồn tại — vui lòng tải lại trang và chọn lại.');
+        const p0 = parentLotSnap.data();
+        const isDecoiling0 = prodSelectedStage === 'Decoiling';
+        const isReslit0 = !isDecoiling0 && p0.stage === 'Slitting';
+        let dateSeg0, xyzSeg0, ab0, parentCd0, parentSeqBase0, isUnknownSlice0 = false, newlyAllocatedXyz0 = null;
+        if (p0.isUnknown) {
+          // FIX LỖI TRÙNG MÃ (2 lớp):
+          // (1) Giữa CÁC LẦN DÙNG của CÙNG 1 mã hàng: cấp AB mới cho mỗi lần checkout (xem bên dưới).
+          // (2) Giữa CÁC MÃ HÀNG KHÁC NHAU: trước đây MỌI mã hàng đều dùng chung xyzSeg='000' cố định,
+          //     nên 2 mã hàng khác nhau, cùng lần dùng lô Chưa xác định thứ N của mã đó, sẽ tính ra
+          //     CÙNG 1 chuỗi mã lô con (VD cả 2 đều ra "000000-000-010000") — vì "lots" là 1 collection
+          //     Firestore dùng chung ID cho toàn hệ thống, không phân theo mã hàng, nên đây là TRÙNG MÃ
+          //     THẬT. Khắc phục: cấp cho MỖI mã hàng một xyzSeg RIÊNG, cố định vĩnh viễn (field
+          //     `unknownXyzSeg` lưu ngay trên document lô "Chưa xác định" của mã hàng đó, chỉ cấp phát 1
+          //     lần duy nhất, các lần sau tái sử dụng) — lấy từ bộ đếm toàn cục `counters/unknownLotXyz`,
+          //     chỉ chọn giá trị có chữ số đầu KHÁC 5/6 để không bao giờ trùng xyzSeg thật của Casting
+          //     (luôn có chữ số đầu là lò luyện 5 hoặc 6).
+          isUnknownSlice0 = true;
+          if (p0.unknownXyzSeg) {
+            xyzSeg0 = p0.unknownXyzSeg;
+          } else {
+            const counterSnap = await tx.get(UNKNOWN_LOT_XYZ_COUNTER_REF());
+            const startFrom = counterSnap.exists() ? (counterSnap.data().next||0) : 0;
+            const xyzNum = nextSafeUnknownXyz(startFrom);
+            if (xyzNum > 999) throw new Error('Đã hết mã số khả dụng để cấp cho lô "Chưa xác định" (giới hạn hệ thống, 800 mã hàng). Vui lòng báo Admin xử lý.');
+            xyzSeg0 = pad3(xyzNum);
+            newlyAllocatedXyz0 = xyzNum; // Pha 2 sẽ ghi lại vào counter + vào chính lô "Chưa xác định" này
+          }
+          const nextAb = (p0.sliceCounter||0) + 1;
+          if (nextAb > 99) throw new Error('Mã hàng này đã dùng "Lô chưa xác định" quá 99 lần (hết số thứ tự khả dụng). Vui lòng báo Admin xử lý dồn/dọn lô chưa xác định trước khi tiếp tục.');
+          dateSeg0 = p0.dateSeg || '000000'; ab0 = pad2(nextAb);
+          parentCd0 = '00'; parentSeqBase0 = 0;
+        } else {
+          dateSeg0 = p0.dateSeg; xyzSeg0 = p0.xyzSeg; ab0 = p0.ab; parentCd0 = p0.cd || '00';
+          parentSeqBase0 = isDecoiling0 ? (p0.decoilCount||0) : (p0.slitCount||0);
+        }
+        const buildChild0 = (seqPadded) => isDecoiling0
+          ? buildLotCode(dateSeg0, xyzSeg0, ab0, seqPadded, '00')
+          : isReslit0
+            ? `${p0.lotCode}-S${seqPadded}`
+            : buildLotCode(dateSeg0, xyzSeg0, ab0, parentCd0, seqPadded);
+        let childCounter0 = 0;
+        let mainCodePlanned = null;
+        const secCodesPlanned0 = new Array(secondaryOutputs.length).fill(null);
+        if (mainNeedsLot) { childCounter0++; mainCodePlanned = buildChild0(pad2(parentSeqBase0 + childCounter0)); }
+        secondaryOutputs.forEach((r, idx) => {
+          if (!secNeedsLot[idx]) return;
+          childCounter0++; secCodesPlanned0[idx] = buildChild0(pad2(parentSeqBase0 + childCounter0));
+        });
+        // AN TOÀN (lưới chặn cuối): kiểm tra các mã lô con dự kiến chưa từng tồn tại trước khi ghi —
+        // chặn mọi khả năng ghi đè trùng mã, kể cả những trường hợp hiếm bộ đếm bị lệch do dữ liệu cũ.
+        const plannedChildCodes0 = [mainCodePlanned, ...secCodesPlanned0].filter(Boolean);
+        for (const code of plannedChildCodes0) {
+          const s = await tx.get(doc(db,'lots', code));
+          if (s.exists()) throw new Error(`Mã lô con "${code}" đã tồn tại trong hệ thống — bộ đếm của lô cha có thể đang bị lệch do dữ liệu cũ. Vui lòng báo Admin kiểm tra lô cha "${p0.isUnknown ? 'Chưa xác định' : (p0.lotCode||'')}" trước khi tiếp tục.`);
+        }
+        parentLotPlan = { p: p0, isDecoiling: isDecoiling0, isReslit: isReslit0, dateSeg: dateSeg0, xyzSeg: xyzSeg0,
+          ab: ab0, parentCd: parentCd0, parentSeqBase: parentSeqBase0, isUnknownSlice: isUnknownSlice0,
+          newlyAllocatedXyz: newlyAllocatedXyz0, mainCode: mainCodePlanned, secCodesPlanned: secCodesPlanned0 };
       } else {
         // Smelting/Recycle: không có lô cha cụ thể — tạm gộp đầu ra vào "lô chưa xác định" nếu vật tư có bật mã lô.
         if (mainNeedsLot) mainUnknownLotInfo = await readLotSnap(tx, outputItemId);
@@ -3609,12 +3839,12 @@ window.submitProduction = async function(btn){
       addDelta(outputItemId, outputQty);
       secondaryOutputs.forEach(r=> addDelta(r.itemId, r.qty));
 
-      let parentNewStock = null, parentSeqBase = null;
+      let parentNewStock = null;
       if (needsParentLot) {
         const p = parentLotSnap.data();
         parentNewStock = (p.stock||0) - parentSel.qty;
         if (parentNewStock < -0.0001) throw new Error('Khối lượng tiêu thụ vượt quá tồn kho hiện tại của lô cha — có thể đã có người khác thao tác trước đó. Vui lòng tải lại trang và chọn lại.');
-        parentSeqBase = prodSelectedStage==='Decoiling' ? (p.decoilCount||0) : (p.slitCount||0);
+        parentRemainingStock = parentNewStock;
         addDelta(parentSel.itemId, -parentSel.qty);
       }
 
@@ -3646,33 +3876,25 @@ window.submitProduction = async function(btn){
         }
       } else if (needsParentLot) {
         const p = parentLotSnap.data();
-        const isDecoiling = prodSelectedStage === 'Decoiling';
-        // "Xẻ lại": lô cha được chọn qua chế độ đặc biệt VÀ bản thân nó đã có stage='Slitting' (tức đã
-        // qua Xẻ băng ít nhất 1 lần trước đó) — không thể dùng công thức mã lô con thông thường (giữ
-        // nguyên cd của cha, chỉ tăng ef) vì cha đã có ef riêng của chính nó rồi, ghép tiếp sẽ dễ TRÙNG
-        // mã với lần xẻ trước (2 lô khác nhau cùng kế thừa 1 cd, mỗi lô lại tự đếm ef từ 0). Thay vào đó
-        // dùng hậu tố "-S<số>" nối thẳng vào lotCode gốc của cha — vì lotCode gốc luôn là duy nhất nên
-        // mã con theo cách này chắc chắn không trùng, đồng thời vẫn thấy rõ ngay là hàng "xẻ lại".
-        const isReslit = !isDecoiling && p.stage === 'Slitting';
-        const dateSeg = p.dateSeg, xyzSeg = p.xyzSeg, ab = p.ab, parentCd = p.cd || '00';
+        // Toàn bộ mã lô con (mainCode/secCodesPlanned) và các thông số dateSeg/xyzSeg/ab/parentCd/
+        // parentSeqBase đã được tính sẵn VÀ kiểm tra không trùng mã ở PHA 1 (xem parentLotPlan) — ở đây
+        // chỉ dùng lại, không tính lại, để đảm bảo khớp đúng 100% với mã đã kiểm tra trùng.
+        const { isDecoiling, isReslit, dateSeg, xyzSeg, ab, parentCd, parentSeqBase, isUnknownSlice,
+          newlyAllocatedXyz, mainCode: mainCodePlanned, secCodesPlanned: secCodesPlanned0 } = parentLotPlan;
         let childCounter = 0;
         const lotBaseChild = {
           isUnknown:false, stage: isDecoiling ? 'Decoiling' : 'Slitting',
           parentLotCode: parentSel.isUnknown ? null : (p.lotCode || null),
           dateSeg, xyzSeg, ab, status:'active', decoilCount:0, slitCount:0,
           createdAt: serverTimestamp(), createdBy: state.userDoc.email,
-          ...(isReslit ? { reslitFrom: p.lotCode } : {})
+          ...(isReslit ? { reslitFrom: p.lotCode } : {}),
+          ...(isUnknownSlice ? { unknownSourceItemId: p.itemId } : {})
         };
-        const buildChild = (seqPadded) => isDecoiling
-          ? buildLotCode(dateSeg, xyzSeg, ab, seqPadded, '00')
-          : isReslit
-            ? `${p.lotCode}-S${seqPadded}`
-            : buildLotCode(dateSeg, xyzSeg, ab, parentCd, seqPadded);
 
         if (mainNeedsLot) {
           childCounter++;
           const seqPadded = pad2(parentSeqBase + childCounter);
-          mainLotCode = buildChild(seqPadded);
+          mainLotCode = mainCodePlanned;
           tx.set(doc(db,'lots',mainLotCode), { ...lotBaseChild, itemId:outputItemId, lotCode:mainLotCode, stock: outputQty,
             cd: isDecoiling ? seqPadded : parentCd, ef: isDecoiling ? '00' : seqPadded });
         }
@@ -3680,16 +3902,29 @@ window.submitProduction = async function(btn){
           if (!secNeedsLot[idx]) return;
           childCounter++;
           const seqPadded = pad2(parentSeqBase + childCounter);
-          const code = buildChild(seqPadded);
+          const code = secCodesPlanned0[idx];
           secLotCodes[idx] = code;
           tx.set(doc(db,'lots',code), { ...lotBaseChild, itemId:r.itemId, lotCode:code, stock: r.qty,
             cd: isDecoiling ? seqPadded : parentCd, ef: isDecoiling ? '00' : seqPadded });
         });
 
         const parentUpdate = { stock: parentNewStock, updatedAt: serverTimestamp() };
+        if (newlyAllocatedXyz !== null && newlyAllocatedXyz !== undefined) {
+          // Ghi lại xyzSeg vừa cấp cho mã hàng này — cố định vĩnh viễn, các lần dùng sau tái sử dụng
+          // (không đọc/cấp lại counter toàn cục nữa).
+          parentUpdate.unknownXyzSeg = xyzSeg;
+          tx.set(UNKNOWN_LOT_XYZ_COUNTER_REF(), { next: newlyAllocatedXyz + 1, updatedAt: serverTimestamp() }, { merge: true });
+        }
         if (childCounter > 0) {
-          if (isDecoiling) parentUpdate.decoilCount = parentSeqBase + childCounter;
-          else parentUpdate.slitCount = parentSeqBase + childCounter;
+          if (isUnknownSlice) {
+            // Chỉ tăng đúng 1 (không theo childCounter) — mỗi TRANSACTION là 1 lần "checkout" AB mới,
+            // dù transaction đó sinh ra 1 hay nhiều lô con (đầu ra phụ) cùng lúc.
+            parentUpdate.sliceCounter = (p.sliceCounter||0) + 1;
+          } else if (isDecoiling) {
+            parentUpdate.decoilCount = parentSeqBase + childCounter;
+          } else {
+            parentUpdate.slitCount = parentSeqBase + childCounter;
+          }
         }
         if (parentNewStock <= 0.0001) parentUpdate.status = 'exhausted';
         tx.update(doc(db,'lots', parentSel.lotDocId), parentUpdate);
@@ -3734,6 +3969,12 @@ window.submitProduction = async function(btn){
     if (needsParentLot) {
       if (mainLotCode) createdLotsForPrint.push({ lotCode: mainLotCode, itemId: outputItemId, qty: outputQty });
       secondaryOutputs.forEach((r,idx)=>{ if (secLotCodes[idx]) createdLotsForPrint.push({ lotCode: secLotCodes[idx], itemId: r.itemId, qty: r.qty }); });
+      // Nếu không dùng hết lô cha (VD xẻ dở cuộn to), phần còn lại vẫn giữ nguyên mã lô cũ và còn tồn
+      // trong hệ thống — đưa luôn vào panel "In tem" để có thể in lại tem cho phần dư này ngay, thay vì
+      // phải quay lại tìm chỗ khác (trước đây không có chỗ nào để làm việc này).
+      if (!parentSel.isUnknown && parentSel.lotCode && parentRemainingStock !== null && parentRemainingStock > 0.0001) {
+        createdLotsForPrint.push({ lotCode: parentSel.lotCode, itemId: parentSel.itemId, qty: parentRemainingStock, note: 'Cuộn cha còn dư — chưa xẻ hết, giữ nguyên mã lô' });
+      }
     }
     toast(mainLotCode ? `Đã lưu báo cáo sản xuất — mã lô: ${mainLotCode}` : 'Đã lưu báo cáo sản xuất — tồn kho đã được cập nhật.', 'success');
     invalidateSnapshotsFrom(date);
@@ -3750,56 +3991,141 @@ window.submitProduction = async function(btn){
 };
 
 /* ---------------------------------------------------------------------
-   IN TEM CUỘN — hàng đợi in (printQueue)
+   IN TEM CUỘN — in trực tiếp qua ZPL/HTTP (giống test-zpl-print.html)
    Sau khi lưu báo cáo Tháo cuộn/Xẻ băng, hiện danh sách các lô vừa sinh ra, cho phép gửi lệnh in
    tem cho từng lô (không tự động in ngay — công nhân tự quyết định khi nào cuộn đó là cuộn CUỐI
    CÙNG sẵn sàng đóng gói, vì 1 lô Tháo cuộn có thể còn bị Xẻ băng tiếp sau đó).
-   Dữ liệu ghi vào collection `printQueue` được 1 script ngoài (chạy trên máy đang có phần mềm in
-   tem Zebra hiện tại) đọc và tự điền vào app in — không ai phải gõ tay lại mã lô/mã hàng/khối lượng.
-   3 trường app in hiện chưa có dữ liệu tương ứng trong hệ thống (Num of distruptions, Work Order,
-   Employee ID) tạm để cố định — sửa ở PRINT_LABEL_DEFAULTS khi hệ thống có dữ liệu thật cho chúng.
+   Không còn qua collection `printQueue`/script ngoài nữa — bấm "In tem" sẽ tự dựng chuỗi ZPL từ
+   dữ liệu của lô (mã lô, mã hàng, khối lượng, ngày) rồi POST thẳng tới máy in Zebra qua
+   http://<IP>/pstprnt, y hệt cách test-zpl-print.html đang làm.
+   Máy chạy trình duyệt (bấm nút này) BẮT BUỘC phải cùng mạng LAN/nhìn thấy IP máy in — nếu hệ
+   thống được mở từ ngoài mạng xưởng, lệnh in sẽ không tới được máy in.
+   "Số lần đứt" (Number of disruptions) chưa có dữ liệu tự động trong hệ thống nên người nhập báo
+   cáo tự gõ số vào ô ngay trên panel in tem trước khi bấm "In tem" (mặc định 0, xem showPrintOfferPanel).
+   Work Order / Employee ID vẫn chưa có dữ liệu thật trong hệ thống, tạm để cố định — sửa ở
+   PRINT_LABEL_DEFAULTS khi hệ thống có dữ liệu thật cho chúng.
 --------------------------------------------------------------------- */
-const PRINT_LABEL_DEFAULTS = { numOfDistruptions: 0, workOrder: '1234', employeeId: 'MV080' };
+const PRINT_LABEL_DEFAULTS = { numOfDistruptions: 0, workOrder: '1234', employeeId: 'MV080', header: 'Magnetec Viet Nam' };
+
+// Toạ độ tem lấy đúng từ Advance Config (đồng bộ với test-zpl-print.html) — nếu tem in lệch vị trí,
+// chỉnh số ở đây cho khớp với chỉnh sửa đã kiểm chứng trên test-zpl-print.html.
+const ZPL_COORDS = {
+  pw: 700, ll: 340,
+  header:  { x:5,   y:20,  h:28, w:26 },
+  model:   { x:5,   y:65,  h:35, w:26 },
+  dist:    { x:5,   y:110, h:32, w:33 },
+  qty:     { x:5,   y:150, h:32, w:30 },
+  article: { x:5,   y:190, h:50, w:50 },
+  date:    { x:5,   y:250, h:32, w:30 },
+  charge:  { x:410, y:262, h:32, w:26 },
+  bc1d:    { x:410, y:225, h:25, w:2 },
+  bc2d:    { x:440, y:20,  size:5 }
+};
+
+function getPrinterIp(){
+  return localStorage.getItem('xuong_printer_ip') || '192.168.233.110';
+}
+window.changePrinterIp = function(){
+  const cur = getPrinterIp();
+  const next = prompt('Nhập địa chỉ IP máy in Zebra (LAN nội bộ xưởng):', cur);
+  if (next && next.trim()) { localStorage.setItem('xuong_printer_ip', next.trim()); toast('Đã lưu IP máy in: ' + next.trim(), 'success'); }
+};
+
+function pad2ZPL(x){ return String(x).padStart(2,'0'); }
+function nowStampZPL(){
+  const d = new Date();
+  return `${d.getFullYear()}.${pad2ZPL(d.getMonth()+1)}.${pad2ZPL(d.getDate())} ${pad2ZPL(d.getHours())}:${pad2ZPL(d.getMinutes())}:${pad2ZPL(d.getSeconds())}`;
+}
+
+/* Dựng chuỗi ZPL cho 1 lô — ánh xạ dữ liệu hệ thống sang các trường tem:
+   Article = mã hàng (it.code), Model = tên hàng (it.name), Charge Number = mã lô (lotCode),
+   Quantity = khối lượng lô, Production date = ngày hôm nay in tem.
+   numOfDistruptions giờ do người nhập báo cáo tự nhập ngay trên panel in tem (xem showPrintOfferPanel),
+   không còn lấy cố định từ PRINT_LABEL_DEFAULTS nữa — tham số này BẮT BUỘC phải truyền vào.
+   Work Order / Employee ID vẫn chưa có dữ liệu thật trong hệ thống nên tạm giữ cố định. */
+function buildZPLForLot(lot, it, numOfDistruptions){
+  const c = ZPL_COORDS;
+  const article = it.code || '';
+  const model = it.name || '';
+  const qty = Number(lot.qty || 0).toFixed(2);
+  const charge = lot.lotCode || '';
+  const dist = Number(numOfDistruptions || 0);
+  const date = nowStampZPL().slice(0,10);
+  const dataMatrixContent = `A:${article}#Q:${qty}#C:${charge}#T:${nowStampZPL()}#N:${dist}#P:${charge}-0001#W:${PRINT_LABEL_DEFAULTS.employeeId}#WO:${PRINT_LABEL_DEFAULTS.workOrder}#ML:00#${model}#`;
+
+  return `^XA
+^PW${c.pw}
+^LL${c.ll}
+^PON
+^CI28
+
+^FO${c.header.x},${c.header.y}^A0N,${c.header.h},${c.header.w}^FD${PRINT_LABEL_DEFAULTS.header}^FS
+^FO${c.model.x},${c.model.y}^A0N,${c.model.h},${c.model.w}^FD${model}^FS
+^FO${c.dist.x},${c.dist.y}^A0N,${c.dist.h},${c.dist.w}^FDNumber of disruption: ${dist}^FS
+^FO${c.qty.x},${c.qty.y}^A0N,${c.qty.h},${c.qty.w}^FDQuantity: ${qty}kg^FS
+^FO${c.article.x},${c.article.y}^A0N,${c.article.h},${c.article.w}^FD${article}^FS
+^FO${c.date.x},${c.date.y}^A0N,${c.date.h},${c.date.w}^FDProduction date: ${date}^FS
+
+^FO${c.bc2d.x},${c.bc2d.y}^BXN,${c.bc2d.size},200,0,0,1^FD${dataMatrixContent}^FS
+^FO${c.bc1d.x},${c.bc1d.y}^BY${c.bc1d.w},2,${c.bc1d.h}^BCN,${c.bc1d.h},N,N,N^FD${charge}^FS
+^FO${c.charge.x},${c.charge.y}^A0N,${c.charge.h},${c.charge.w}^FD${charge}^FS
+
+^XZ`;
+}
+
+async function sendZPLToPrinter(zpl){
+  const ip = getPrinterIp();
+  // mode:'no-cors' giống test-zpl-print.html — trình duyệt sẽ không đọc được response (opaque),
+  // nên không thể biết chắc máy in có nhận được hay không; đây là hạn chế vốn có của cách in này,
+  // không phải lỗi code. Nếu cần xác nhận chắc chắn, cân nhắc quay lại cơ chế hàng đợi + script ngoài.
+  await fetch(`http://${ip}/pstprnt`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: zpl,
+    mode: 'no-cors'
+  });
+}
 
 window.showPrintOfferPanel = function(lots){
   const rowsHtml = lots.map((l,idx)=>{
     const it = state.items.find(i=>i.id===l.itemId);
     return `
     <tr id="print-row-${idx}">
-      <td class="mono">${esc(l.lotCode)}</td>
+      <td class="mono">${esc(l.lotCode)}${l.note?`<br><span class="hint" style="font-weight:400;color:var(--amber-600);">${esc(l.note)}</span>`:''}</td>
       <td class="mono">${esc(it?.code||'—')}</td>
       <td>${esc(it?.name||'—')}</td>
       <td style="text-align:right;" class="mono">${fmt(l.qty)} ${esc(it?.unit||'')}</td>
+      <td style="text-align:center;"><input type="number" class="mono" id="dist-input-${idx}" value="${PRINT_LABEL_DEFAULTS.numOfDistruptions}" min="0" step="1" style="width:60px;text-align:center;" title="Số lần đứt cuộn trong quá trình sản xuất lô này"></td>
       <td style="text-align:right;"><button class="btn btn-primary btn-sm" id="print-btn-${idx}" onclick='queuePrintLabel(${idx}, ${JSON.stringify(l).replace(/'/g,"&#39;")})'>🖨 In tem</button></td>
     </tr>`;
   }).join('');
   openModal(`
-    <div class="cond" style="font-weight:700;font-size:15px;margin-bottom:4px;">Đã lưu báo cáo — cuộn vừa tạo</div>
-    <p class="hint" style="margin-bottom:10px;">Chỉ bấm "In tem" cho cuộn đã CHẮC CHẮN là cuộn cuối cùng, sẵn sàng đóng gói — nếu cuộn này còn phải Xẻ băng tiếp thì đừng in ở đây, in sau khi Xẻ băng xong.</p>
-    <div class="table-wrap"><table><thead><tr><th>Mã lô</th><th>Mã hàng</th><th>Tên</th><th style="text-align:right;">Khối lượng</th><th></th></tr></thead><tbody>${rowsHtml}</tbody></table></div>
+    <div class="cond" style="font-weight:700;font-size:15px;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between;gap:8px;">
+      <span>Đã lưu báo cáo — cuộn vừa tạo</span>
+      <button class="btn btn-ghost btn-sm" onclick="changePrinterIp()" title="Đổi IP máy in">⚙ IP máy in: ${esc(getPrinterIp())}</button>
+    </div>
+    <p class="hint" style="margin-bottom:10px;">Chỉ bấm "In tem" cho cuộn đã CHẮC CHẮN là cuộn cuối cùng, sẵn sàng đóng gói — nếu cuộn này còn phải Xẻ băng tiếp thì đừng in ở đây, in sau khi Xẻ băng xong. Nhập số lần đứt cuộn (nếu có) trước khi in.</p>
+    <div class="table-wrap"><table><thead><tr><th>Mã lô</th><th>Mã hàng</th><th>Tên</th><th style="text-align:right;">Khối lượng</th><th style="text-align:center;">Số lần đứt</th><th></th></tr></thead><tbody>${rowsHtml}</tbody></table></div>
     <div style="margin-top:14px;text-align:right;"><button class="btn btn-ghost" onclick="closeModal()">Đóng</button></div>
   `);
 };
 
 window.queuePrintLabel = async function(idx, lot){
   const btn = document.getElementById(`print-btn-${idx}`);
+  const distEl = document.getElementById(`dist-input-${idx}`);
+  const numOfDistruptions = distEl ? Number(distEl.value || 0) : PRINT_LABEL_DEFAULTS.numOfDistruptions;
   if (btn) { btn.disabled = true; btn.textContent = 'Đang gửi...'; }
   try {
     const it = state.items.find(i=>i.id===lot.itemId);
     if (!it) throw new Error('Không tìm thấy thông tin mã hàng.');
-    await addDoc(collection(db,'printQueue'), {
-      lotCode: lot.lotCode, itemId: lot.itemId, itemCode: it.code, itemName: it.name,
-      qty: lot.qty, unit: it.unit,
-      numOfDistruptions: PRINT_LABEL_DEFAULTS.numOfDistruptions,
-      workOrder: PRINT_LABEL_DEFAULTS.workOrder,
-      employeeId: PRINT_LABEL_DEFAULTS.employeeId,
-      status: 'pending', createdBy: state.userDoc.email, createdAt: serverTimestamp()
-    });
+    const zpl = buildZPLForLot(lot, it, numOfDistruptions);
+    await sendZPLToPrinter(zpl);
     if (btn) { btn.textContent = '✓ Đã gửi lệnh in'; btn.classList.remove('btn-primary'); btn.classList.add('btn-ghost'); }
-    toast(`Đã gửi lệnh in tem cho lô ${lot.lotCode}.`, 'success');
+    if (distEl) distEl.disabled = true;
+    toast(`Đã gửi lệnh in tem cho lô ${lot.lotCode} tới máy in ${getPrinterIp()}.`, 'success');
   } catch(err){
     if (btn) { btn.disabled = false; btn.textContent = '🖨 In tem'; }
-    toast('Lỗi gửi lệnh in: ' + err.message, 'error');
+    toast('Lỗi gửi lệnh in (kiểm tra IP máy in / kết nối mạng): ' + err.message, 'error');
   }
 };
 
@@ -3875,7 +4201,7 @@ function renderRework(){
         ${state.reworks.slice(0,25).map(r=>`<tr>
           <td class="mono">${r.date}</td>
           <td>${itemName(r.inputItemId)} <span class="mono">-${fmt(r.inputQty)} ${itemUnit(r.inputItemId)}</span>${r.inputLotDocId?` <span class="hint">(${r.inputLotCode?esc(r.inputLotCode):'chưa xác định'})</span>`:''}</td>
-          <td>${itemName(r.outputItemId)} <span class="mono">+${fmt(r.outputQty)} ${itemUnit(r.outputItemId)}</span>${r.outputLotDocId?` <span class="hint">(chưa xác định)</span>`:''}</td>
+          <td>${itemName(r.outputItemId)} <span class="mono">+${fmt(r.outputQty)} ${itemUnit(r.outputItemId)}</span>${r.outputLotCode?` <span class="hint">(${esc(r.outputLotCode)})</span> <button class="btn btn-ghost btn-sm" onclick="reprintLabel('${esc(r.outputLotCode)}')" title="In lại tem cho lô này">🖨</button>`:(r.outputLotDocId?` <span class="hint">(chưa xác định)</span>`:'')}</td>
           <td>${r.isQcReject?`<span class="badge scrap">Lỗi QC — ${esc(r.stageFound||'')}</span> ${esc(r.reason||'')}${r.note?' — '+esc(r.note):''}`:(r.note?esc(r.note):'—')}</td>
         </tr>`).join('')}
       </tbody></table></div>` : emptyState('Chưa có phiếu Rework nào.')}
@@ -3946,17 +4272,27 @@ window.onRwInputLotChange = function(){
   if (infoEl) infoEl.textContent = `Tồn lô: ${fmt(lot.stock)} ${itemUnit(lot.itemId)} — có thể sửa khối lượng giảm xuống nếu chỉ rework 1 phần.`;
 };
 
-/* Gợi ý cho ĐẦU RA khi mã đầu ra có bật mã lô — Rework không có nhãn vật lý để quét/sinh mã lô truy
-   xuất mới, nên hàng ra sẽ được cộng vào lô "chưa xác định" của mã đó (giống các dòng NVL phụ trong
-   báo cáo sản xuất). Muốn có mã lô thật, xử lý qua công đoạn sản xuất/đóng gói bình thường. */
+/* Gợi ý cho ĐẦU RA khi mã đầu ra có bật mã lô.
+   Từ nay Rework CỐ GẮNG GIỮ NGUYÊN số lô (để không mất truy xuất khi chỉ đổi mã hàng, VD hàng lỗi
+   kích thước gia công lại thành mã khác nhưng vẫn là đúng cuộn/lô vật lý đó):
+   - Nếu chọn đúng 1 lô đầu vào cụ thể (không phải "chưa xác định") VÀ rework HẾT lô đó → lô được
+     "đổi tên" sang mã đầu ra, giữ nguyên số lô — vẫn cùng 1 document trên Firestore.
+   - Nếu chỉ rework MỘT PHẦN lô (còn lại vẫn ở mã cũ) → tạo 1 lô con mới "<số lô gốc>-RW<số thứ tự>",
+     gắn parentLotCode về lô gốc để vẫn truy xuất ngược được.
+   - Nếu mã đầu vào không bật mã lô, hoặc chọn lô "chưa xác định" (vốn đã mất truy xuất) → không có gì
+     để giữ, hàng ra sẽ cộng vào lô "chưa xác định" của mã đầu ra như trước đây.
+   Sau khi lưu phiếu, nếu có lô thật (đổi tên hoặc lô con mới), hệ thống sẽ mở bảng in tem để in lại
+   nhãn cho lô đó (vì nhãn cũ — nếu có — vẫn ghi mã hàng cũ). */
 window.onRwOutputItemChange = function(){
   const itemId = document.getElementById('rw-output')?.value;
   const it = state.items.find(i=>i.id===itemId);
   const el = document.getElementById('rw-output-lot-hint');
   if (!el) return;
-  el.innerHTML = (itemId && itemUsesLot(it))
-    ? `<p class="hint" style="color:var(--amber-600);margin:-8px 0 12px;">Mã này có bật mã lô — hàng ra từ Rework sẽ được cộng vào lô "chưa xác định" (Rework không tạo mã lô truy xuất mới).</p>`
-    : '';
+  if (!itemId || !itemUsesLot(it)) { el.innerHTML = ''; return; }
+  const canKeep = itemUsesLot(state.items.find(i=>i.id===document.getElementById('rw-input')?.value)) && rwInputLot && !rwInputLot.isUnknown;
+  el.innerHTML = canKeep
+    ? `<p class="hint" style="color:var(--amber-600);margin:-8px 0 12px;">Mã này có bật mã lô — hệ thống sẽ CỐ GẮNG GIỮ NGUYÊN số lô đầu vào cho hàng ra (đổi tên lô nếu rework hết lô, hoặc tạo lô con "-RW.." nếu chỉ rework 1 phần). Sau khi lưu sẽ có bảng in lại tem cho lô này.</p>`
+    : `<p class="hint" style="color:var(--amber-600);margin:-8px 0 12px;">Mã này có bật mã lô — vì mã/lô đầu vào chưa xác định được lô cụ thể nên hàng ra sẽ được cộng vào lô "chưa xác định" (không giữ được số lô truy xuất).</p>`;
 };
 
 window.submitRework = async function(btn){
@@ -4002,6 +4338,9 @@ window.submitRework = async function(btn){
     }
     const selectedInputLot = inputUsesLot ? rwInputLot : null;
 
+    // Kết quả lô đầu ra (điền trong transaction) — dùng sau khi lưu xong để mở bảng in tem.
+    let outputLotForPrint = null; // { lotCode, itemId, qty } — chỉ set khi có lô THẬT (đổi tên hoặc lô con mới)
+
     try {
       await runTransaction(db, async (tx) => {
         // ============ PHA 1 — TẤT CẢ LƯỢT ĐỌC ============
@@ -4011,34 +4350,88 @@ window.submitRework = async function(btn){
         const outputSnap = await tx.get(outputRef);
         if (!inputSnap.exists() || !outputSnap.exists()) throw new Error('Vật tư không tồn tại.');
 
-        // Lô đầu vào: trừ đúng lô đã chọn (hoặc lô "chưa xác định" nếu mã có bật mã lô nhưng không chọn
-        // được lô cụ thể). Lô đầu ra: Rework không có nhãn vật lý để sinh mã lô truy xuất mới, nên LUÔN
-        // cộng vào lô "chưa xác định" của mã đầu ra (giống các dòng NVL phụ trong báo cáo sản xuất).
         const inputLotInfo = inputUsesLot ? await readLotSnap(tx, inputItemId, selectedInputLot ? doc(db,'lots', selectedInputLot.lotDocId) : null) : null;
-        const outputLotInfo = outputUsesLot ? await readLotSnap(tx, outputItemId) : null;
+
+        // Có thể GIỮ NGUYÊN số lô cho đầu ra khi: cả 2 mã đều bật mã lô, VÀ đã chọn đúng 1 lô đầu vào
+        // cụ thể (không phải "chưa xác định" — lô đó vốn đã mất truy xuất nên không có gì để giữ).
+        const canKeepLotCode = !!(inputUsesLot && outputUsesLot && selectedInputLot && !selectedInputLot.isUnknown
+          && inputLotInfo && inputLotInfo.snap.exists());
+
+        let isFullLotRework = false;
+        let childLotCode = null;
+        if (canKeepLotCode) {
+          const curStock = inputLotInfo.snap.data().stock || 0;
+          isFullLotRework = Math.abs(curStock - inputQty) <= 0.0001; // rework hết sạch lô này
+          if (!isFullLotRework) {
+            const reworkSeq = (inputLotInfo.snap.data().reworkCount || 0) + 1;
+            childLotCode = `${selectedInputLot.lotCode}-RW${pad2(reworkSeq)}`;
+            const existSnap = await tx.get(doc(db,'lots', childLotCode));
+            if (existSnap.exists()) throw new Error(`Mã lô con "${childLotCode}" đã tồn tại — có thể vừa có người khác rework lô này. Vui lòng tải lại trang và thử lại.`);
+          }
+        }
+
+        // Chỉ đọc/dùng lô "chưa xác định" của mã đầu ra khi KHÔNG giữ được số lô (rơi về cách cũ).
+        const outputUnknownLotInfo = (outputUsesLot && !canKeepLotCode) ? await readLotSnap(tx, outputItemId) : null;
 
         // ============ PHA 2 — TẤT CẢ LƯỢT GHI ============
         tx.update(inputRef, { stock: (inputSnap.data().stock||0) - inputQty, updatedAt: serverTimestamp() });
         tx.update(outputRef, { stock: (outputSnap.data().stock||0) + outputQty, updatedAt: serverTimestamp() });
 
-        if (inputLotInfo) {
-          if (selectedInputLot && inputLotInfo.snap.exists()) {
-            // Lô cụ thể (không phải "chưa xác định") — gộp chung 1 lượt ghi (giống Xuất kho) để tránh
-            // update() 2 lần trên cùng 1 document trong 1 transaction.
-            const newLotStock = (inputLotInfo.snap.data().stock||0) - inputQty;
-            tx.update(inputLotInfo.ref, { stock: newLotStock, status: newLotStock<=0.0001 ? 'exhausted' : 'active', updatedAt: serverTimestamp() });
-          } else {
-            writeLotDelta(tx, -inputQty, inputLotInfo);
+        let outputLotDocId = null, outputLotCode = null;
+
+        if (canKeepLotCode && isFullLotRework) {
+          // Dùng hết lô — đổi hẳn document lô này sang mã đầu ra, GIỮ NGUYÊN số lô (1 lượt ghi duy
+          // nhất trên chính document đó, không tách trừ tồn + cộng tồn như thường lệ).
+          const cur = inputLotInfo.snap.data();
+          tx.update(inputLotInfo.ref, {
+            itemId: outputItemId, stock: outputQty, status: 'active',
+            reworkedFrom: inputItemId, reworkCount: (cur.reworkCount||0) + 1,
+            updatedAt: serverTimestamp()
+          });
+          outputLotDocId = inputLotInfo.ref.id;
+          outputLotCode = selectedInputLot.lotCode;
+        } else if (canKeepLotCode) {
+          // Rework một phần — trừ tồn lô gốc như bình thường (vẫn giữ mã cũ cho phần còn lại), đồng
+          // thời tạo 1 lô con mới mang mã đầu ra, gắn parentLotCode để truy xuất ngược về lô gốc.
+          const cur = inputLotInfo.snap.data();
+          const newLotStock = (cur.stock||0) - inputQty;
+          tx.update(inputLotInfo.ref, {
+            stock: newLotStock, status: newLotStock<=0.0001 ? 'exhausted' : 'active',
+            reworkCount: (cur.reworkCount||0) + 1, updatedAt: serverTimestamp()
+          });
+          tx.set(doc(db,'lots', childLotCode), {
+            itemId: outputItemId, lotCode: childLotCode, isUnknown: false,
+            stage: cur.stage || 'Unknown', parentLotCode: selectedInputLot.lotCode,
+            dateSeg: cur.dateSeg||null, xyzSeg: cur.xyzSeg||null, ab: cur.ab||null, cd: cur.cd||null, ef: cur.ef||null,
+            stock: outputQty, status: 'active', decoilCount: 0, slitCount: 0, reworkCount: 0,
+            reworkedFrom: inputItemId, createdAt: serverTimestamp(), createdBy: state.userDoc.email
+          });
+          outputLotDocId = childLotCode;
+          outputLotCode = childLotCode;
+        } else {
+          // Cách cũ (không giữ được số lô): trừ lô đầu vào (cụ thể hoặc "chưa xác định") bình thường,
+          // cộng đầu ra vào lô "chưa xác định" của mã đầu ra.
+          if (inputLotInfo) {
+            if (selectedInputLot && inputLotInfo.snap.exists()) {
+              const newLotStock = (inputLotInfo.snap.data().stock||0) - inputQty;
+              tx.update(inputLotInfo.ref, { stock: newLotStock, status: newLotStock<=0.0001 ? 'exhausted' : 'active', updatedAt: serverTimestamp() });
+            } else {
+              writeLotDelta(tx, -inputQty, inputLotInfo);
+            }
+          }
+          if (outputUnknownLotInfo) {
+            writeLotDelta(tx, outputQty, outputUnknownLotInfo);
+            outputLotDocId = outputUnknownLotInfo.ref.id;
           }
         }
-        if (outputLotInfo) writeLotDelta(tx, outputQty, outputLotInfo);
 
         const rwRef = doc(collection(db,'reworks'));
         tx.set(rwRef, {
           inputItemId, inputQty, outputItemId, outputQty, date, note,
           inputLotDocId: selectedInputLot?.lotDocId || null,
           inputLotCode: selectedInputLot?.lotCode || null,
-          outputLotDocId: outputLotInfo ? outputLotInfo.ref.id : null,
+          outputLotDocId, outputLotCode,
+          outputLotKept: canKeepLotCode,
           isQcReject: !!rwIsQcReject,
           stageFound: rwIsQcReject ? stageFound : null,
           reason: rwIsQcReject ? reason : null,
@@ -4049,12 +4442,17 @@ window.submitRework = async function(btn){
         tx.set(ledgerOutRef, { itemId: inputItemId, delta: -inputQty, type:'rework_consume', date, refId: rwRef.id, createdAt: serverTimestamp() });
         const ledgerInRef = doc(collection(db,'stockLedger'));
         tx.set(ledgerInRef, { itemId: outputItemId, delta: outputQty, type:'rework_produce', date, refId: rwRef.id, createdAt: serverTimestamp() });
+
+        if (canKeepLotCode) outputLotForPrint = { lotCode: outputLotCode, itemId: outputItemId, qty: outputQty };
       });
       toast(rwIsQcReject ? 'Đã ghi nhận hàng lỗi QC — tồn kho đã cập nhật.' : 'Đã lưu phiếu Rework — tồn kho đã cập nhật.', 'success');
       invalidateSnapshotsFrom(date);
       rwInputLot = null;
       rwIsQcReject = false;
       setTab('rework');
+      // Lô đầu ra giữ được số lô (đổi tên hoặc lô con mới) — nhãn cũ (nếu có) vẫn ghi mã hàng cũ,
+      // nên mở luôn bảng in tem để in lại nhãn đúng cho lô này.
+      if (outputLotForPrint) showPrintOfferPanel([outputLotForPrint]);
     } catch(err){
       toast('Lỗi: ' + err.message, 'error');
     }
@@ -4072,7 +4470,7 @@ window.openEditRework = function(id){
   if (r.inputLotDocId || r.outputLotDocId) {
     openModal(`
       <div class="cond" style="font-weight:700;font-size:15px;margin-bottom:14px;">Sửa phiếu Rework</div>
-      <p class="hint" style="color:var(--amber-600);">Phiếu này có gắn mã lô${r.inputLotCode?` (lô đầu vào: ${esc(r.inputLotCode)})`:''} nên không thể sửa khối lượng ở đây — việc này sẽ làm lệch tồn kho theo lô. Nếu cần đổi khối lượng, hãy <b>xoá phiếu này rồi tạo lại</b>. Bạn chỉ có thể sửa ngày và ghi chú bên dưới.</p>
+      <p class="hint" style="color:var(--amber-600);">Phiếu này có gắn mã lô${r.inputLotCode?` (lô đầu vào: ${esc(r.inputLotCode)})`:''}${r.outputLotCode?` (lô đầu ra: ${esc(r.outputLotCode)}${r.outputLotCode===r.inputLotCode?' — đã đổi tên sang mã mới':' — lô con mới'})`:''} nên không thể sửa khối lượng ở đây — việc này sẽ làm lệch tồn kho theo lô. Nếu cần đổi khối lượng, hãy <b>xoá phiếu này rồi tạo lại</b>. Bạn chỉ có thể sửa ngày và ghi chú bên dưới.</p>
       <div class="field"><label>Mã đầu vào</label><input type="text" value="${itemName(r.inputItemId)} — ${fmt(r.inputQty)} ${itemUnit(r.inputItemId)}" disabled></div>
       <div class="field"><label>Mã đầu ra</label><input type="text" value="${itemName(r.outputItemId)} — ${fmt(r.outputQty)} ${itemUnit(r.outputItemId)}" disabled></div>
       <div class="field"><label>Ngày</label><input type="date" id="edit-rw-date" value="${r.date}"></div>
@@ -4847,7 +5245,7 @@ function matchesHistoryQuery(kind, r){
   const parts = [];
   if (kind==='receipts') parts.push(itemNameRaw(r.itemId), r.note, r.createdBy);
   if (kind==='issues') parts.push(itemNameRaw(r.itemId), r.note, r.dest, r.createdBy);
-  if (kind==='reworks') parts.push(itemNameRaw(r.inputItemId), itemNameRaw(r.outputItemId), r.note, r.createdBy);
+  if (kind==='reworks') parts.push(itemNameRaw(r.inputItemId), itemNameRaw(r.outputItemId), r.note, r.createdBy, r.inputLotCode, r.outputLotCode);
   if (kind==='reports') parts.push(itemNameRaw(r.outputItemId), r.note, r.createdBy, ...(r.consumed||[]).map(c=>itemNameRaw(c.itemId)), ...getSecondaryOutputs(r).map(s=>itemNameRaw(s.itemId)));
   return parts.filter(Boolean).some(p=>String(p).toLowerCase().includes(q));
 }
@@ -4963,7 +5361,7 @@ function renderHistoryResult(){
     </tbody></table></div>`);
   } else if (kind === 'reworks') {
     content = bodyHtml(filtered, 'phiếu Rework', `<div class="table-wrap"><table><thead><tr><th>Ngày</th><th>Từ mã</th><th>Thành mã</th><th>Ghi chú</th>${isAdmin?'<th></th>':''}</tr></thead><tbody>
-      ${filtered.map(r=>`<tr><td class="mono">${r.date}</td><td>${itemName(r.inputItemId)} <span class="mono">-${fmt(r.inputQty)}</span></td><td>${itemName(r.outputItemId)} <span class="mono">+${fmt(r.outputQty)}</span></td><td>${r.isQcReject?`<span class="badge scrap">Lỗi QC — ${esc(r.stageFound||'')}</span> ${esc(r.reason||'')}<br>`:''}${r.note?esc(r.note):(r.isQcReject?'':'—')}${r.editedBy?` <span class="hint">(đã sửa)</span>`:''}<div class="hint">${r.createdBy?esc(r.createdBy):'—'}</div></td>${isAdmin?`<td style="white-space:nowrap;"><button class="btn btn-ghost btn-sm" onclick="openEditRework('${r.id}')">Sửa</button> <button class="btn btn-danger btn-sm" onclick="deleteTransaction('reworks','${r.id}','phiếu Rework')">Xoá</button></td>`:''}</tr>`).join('')}
+      ${filtered.map(r=>`<tr><td class="mono">${r.date}</td><td>${itemName(r.inputItemId)} <span class="mono">-${fmt(r.inputQty)}</span>${r.inputLotCode?` <span class="hint">(${esc(r.inputLotCode)})</span>`:''}</td><td>${itemName(r.outputItemId)} <span class="mono">+${fmt(r.outputQty)}</span>${r.outputLotCode?` <span class="hint">(${esc(r.outputLotCode)})</span> <button class="btn btn-ghost btn-sm" onclick="reprintLabel('${esc(r.outputLotCode)}')" title="In lại tem cho lô này">🖨</button>`:(r.outputLotDocId?` <span class="hint">(chưa xác định)</span>`:'')}</td><td>${r.isQcReject?`<span class="badge scrap">Lỗi QC — ${esc(r.stageFound||'')}</span> ${esc(r.reason||'')}<br>`:''}${r.note?esc(r.note):(r.isQcReject?'':'—')}${r.editedBy?` <span class="hint">(đã sửa)</span>`:''}<div class="hint">${r.createdBy?esc(r.createdBy):'—'}</div></td>${isAdmin?`<td style="white-space:nowrap;"><button class="btn btn-ghost btn-sm" onclick="openEditRework('${r.id}')">Sửa</button> <button class="btn btn-danger btn-sm" onclick="deleteTransaction('reworks','${r.id}','phiếu Rework')">Xoá</button></td>`:''}</tr>`).join('')}
     </tbody></table></div>`);
   }
 
