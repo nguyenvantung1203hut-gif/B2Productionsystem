@@ -883,9 +883,19 @@ window.deleteTransaction = async function(collectionName, docId, label){
 
       if (issueLotSnap && issueLotSnap.exists()) {
         const l = issueLotSnap.data();
+        // FIX (cùng gốc với bug ở submitIssue — xem phân tích): trước đây luôn ghi cứng
+        // `location:'warehouse'` khi hoàn tác 1 phiếu xuất, không kiểm tra xem lô đó có phải là "lô
+        // chưa xác định" hay không. Nếu phiếu xuất đang xoá từng được xuất trực tiếp từ "Lô chưa xác
+        // định" (issueData.lotDocId === UNKNOWN_<itemId>), việc này sẽ gán `location:'warehouse'` lên
+        // chính document đó — khiến nó khớp đồng thời cả 2 điều kiện lọc trong loadWarehouseLots()
+        // (isUnknown==true VÀ location==warehouse) và bị cộng tồn 2 lần ở tab "Kho thành phẩm". Chỉ
+        // ghi `location` khi lô được hoàn tác KHÔNG phải là lô "chưa xác định" của đúng mã hàng đó.
+        const isUnknownIssueLot = issueLotRef.id === unknownLotDocId(issueData.itemId);
         tx.update(issueLotRef, {
           stock: (l.stock||0) + issueData.qty,
-          status: 'active', location: 'warehouse', updatedAt: serverTimestamp()
+          status: 'active',
+          ...(isUnknownIssueLot ? {} : { location: 'warehouse' }),
+          updatedAt: serverTimestamp()
         });
       }
 
@@ -1504,6 +1514,10 @@ function toNum(v){
   if (!/^-?\d+(\.\d+)?$/.test(s)) return NaN;
   return parseFloat(s);
 }
+/* Làm tròn về 6 chữ số thập phân — loại "nhiễu" dấu phẩy động (VD 0.1+0.2 = 0.30000000000000004)
+   khi cộng dồn nhiều phép tính liên tiếp. Dùng chung cho báo cáo Sổ cái VÀ mọi nơi ghi lại
+   items.stock tính từ tổng stockLedger (xem reconcileInventory), để cả 2 phía luôn nhất quán. */
+function roundQty(v){ return Math.round((v + Number.EPSILON) * 1e6) / 1e6; }
 /* Escape chuỗi trước khi chèn vào innerHTML — chống XSS lưu trữ từ các trường tự do
    (ghi chú, nơi nhận, tên vật tư, email...) mà người dùng có thể nhập tuỳ ý. */
 function esc(s){
@@ -1743,7 +1757,15 @@ window.loadWarehouseLots = async function(){
     // lô nữa (tổng tồn kho thật của mã này đã nằm trọn trong item.stock, không liên quan gì tới lô này).
     const unkLots = unkSnap.docs.map(d=>({ id:d.id, ...d.data() }))
       .filter(l=>(l.stock||0)>0 && itemUsesLot(state.items.find(i=>i.id===l.itemId)));
-    warehouseLotsCache = whLots.concat(unkLots);
+    // FIX (lệch tồn Kho thành phẩm — xem phân tích): 2 query trên VỀ NGUYÊN TẮC không nên trùng
+    // document nào (lô chưa xác định không nên bao giờ có location:'warehouse'), nhưng dữ liệu cũ có
+    // thể đã bị dính 1 bug trước đây (nay đã sửa ở submitIssue/deleteTransaction) khiến 1 số document
+    // "chưa xác định" bị gán nhầm location:'warehouse'. Nếu không lọc, document đó sẽ nằm trong CẢ
+    // whLots lẫn unkLots, bị concat() cộng tồn 2 lần khi gộp nhóm bên dưới. Dedupe theo doc.id ở đây
+    // là lưới chặn cuối, tự sửa hiển thị ngay cả cho các document đã bị dính lỗi từ trước, không cần
+    // chạy migrate dữ liệu riêng.
+    const seenIds = new Set(whLots.map(l=>l.id));
+    warehouseLotsCache = whLots.concat(unkLots.filter(l=>!seenIds.has(l.id)));
     filterWarehouseLots();
   } catch(err){
     if (el) el.innerHTML = `<p class="hint" style="color:var(--danger-600);">Lỗi tải danh sách: ${esc(err.message)}</p>`;
@@ -2873,7 +2895,17 @@ window.submitIssue = async function(btn){
         // ============ PHA 2 — GHI ============
         tx.update(itemRef, { stock: (itemSnap.data().stock||0) - qty, updatedAt: serverTimestamp() });
         if (lotInfo) {
-          if (selectedLot && lotInfo.snap.exists()) {
+          // FIX (lệch tồn Kho thành phẩm — xem phân tích): trước đây điều kiện ở đây chỉ kiểm tra
+          // `selectedLot && lotInfo.snap.exists()`, KHÔNG loại trừ trường hợp `selectedLot.isUnknown`
+          // — dù comment bên dưới ghi rõ "không phải chưa xác định". Khi user chọn xuất trực tiếp từ
+          // "Lô chưa xác định" (được phép, xem renderIssLotPicker), nhánh này vẫn chạy và ghi
+          // `location:'warehouse'` LÊN CHÍNH document "lô chưa xác định". Từ đó document này vừa có
+          // `isUnknown:true` vừa có `location:'warehouse'`, nên khớp CẢ HAI query trong
+          // loadWarehouseLots() (where isUnknown==true VÀ where location==warehouse) → bị cộng tồn 2
+          // lần khi gộp nhóm theo mã hàng ở tab "Kho thành phẩm". Thêm `!selectedLot.isUnknown` để chỉ
+          // nhánh này chạy cho lô THẬT — lô chưa xác định luôn đi qua writeLotDelta() ở nhánh else,
+          // vốn chỉ cập nhật `stock`, không bao giờ đụng tới `location`.
+          if (selectedLot && !selectedLot.isUnknown && lotInfo.snap.exists()) {
             // Lô cụ thể (không phải "chưa xác định") — gộp CHUNG 1 lượt ghi (stock + trạng thái) để
             // tránh update() 2 lần trên cùng 1 document trong 1 transaction (xem ghi chú ở readLotSnap).
             const newLotStock = (lotInfo.snap.data().stock||0) - qty;
@@ -3061,7 +3093,8 @@ window.generateReport = async function(){
     // hàm fmt() hiển thị đã tự làm tròn 3 số thập phân, nhưng khi xuất CSV lại ghi thẳng số gốc chưa
     // làm tròn nên bị lộ ra dạng khoa học (E-15) khi mở bằng Excel. 6 số thập phân là đủ dư so với độ
     // chính xác thực tế cần dùng (kg/cuộn), nên làm tròn ở đây không làm mất số liệu thật nào.
-    const roundQty = v => Math.round((v + Number.EPSILON) * 1e6) / 1e6;
+    // (Hàm roundQty giờ dùng chung toàn cục — xem khai báo cạnh toNum() — để reconcileInventory cũng
+    // làm tròn nhất quán khi ghi items.stock từ tổng sổ cái.)
     // Công thức: Tồn cuối kỳ = Tồn đầu kỳ + Nhập ngoài + Nội bộ Tăng + Nội bộ Giảm + Xuất ngoài + Điều chỉnh
     // (Tồn đầu kỳ giờ lấy trực tiếp từ openingMap — tổng phát sinh TRƯỚC startStr — không còn suy ngược
     // từ 1 số dư cuối kỳ đọc từ cache, nên không còn rủi ro cộng dồn 2 lần khi cache lỗi thời.)
@@ -4938,9 +4971,21 @@ window.filterLotBrowser = function(filter){
     : emptyState(filter==='workshop' ? 'Không có lô nào đang ở xưởng (chưa đóng gói).' : filter==='warehouse' ? 'Chưa có lô nào ở Kho thành phẩm.' : 'Vật tư này chưa có lô nào được ghi nhận.');
 };
 
+/* FIX #2 (RCA lệch tồn kho, xem phân tích): TRƯỚC ĐÂY hàm này coi items.stock (con số hiển thị ở
+   Danh mục — chỉ là 1 running-balance cache, có thể bị lệch do lỗi ghi không nguyên tử như đã sửa ở
+   FIX #1, hoặc do bất kỳ nguyên nhân nào khác chưa phát hiện) là ĐÚNG TUYỆT ĐỐI, rồi tự thêm 1 dòng
+   stockLedger giả loại 'reconcile' để ép sổ cái khớp theo con số đó. Hệ quả: nếu items.stock đang sai,
+   thao tác "đối chiếu" sẽ ĐÓNG ĐINH VĨNH VIỄN cái sai đó vào sổ cái dưới danh nghĩa 1 điều chỉnh hợp
+   lệ — từ đó cả 2 phía lại khớp nhau nhưng CẢ HAI ĐỀU SAI so với thực tế, và không còn cách nào truy
+   ngược lại giao dịch gốc gây lệch nữa.
+   NAY ĐẢO NGƯỢC ĐÚNG CHIỀU: Σ stockLedger là nguồn chuẩn duy nhất (đúng như tab "Báo cáo tồn kho" /
+   Sổ cái vẫn luôn tin tưởng — xem generateReport, luôn tính trực tiếp từ stockLedger, không đụng tới
+   items.stock). items.stock chỉ là cache hiển thị cho nhanh — nếu lệch, SỬA LẠI items.stock cho khớp
+   sổ cái, TUYỆT ĐỐI KHÔNG ghi thêm gì vào sổ cái (sổ cái là nhật ký giao dịch thật, không phải chỗ để
+   vá số liệu hiển thị). */
 window.reconcileInventory = async function(){
   if (!requireAdmin()) return;
-  if (!(await appConfirm('Đối chiếu tồn kho thực tế với nhật ký giao dịch cho TẤT CẢ vật tư? Nếu có chênh lệch (do dữ liệu cũ trước khi hệ thống ghi đầy đủ nhật ký), hệ thống sẽ tự thêm 1 dòng "điều chỉnh đối chiếu" cho từng vật tư bị lệch, lấy số tồn kho hiện tại trong Danh mục làm chuẩn.\n\nChỉ dùng khi bạn chắc chắn số tồn kho hiện tại trong Danh mục là đúng thực tế.', {okLabel:'Đồng ý, đối chiếu'}))) return;
+  if (!(await appConfirm('Đối chiếu tồn kho hiển thị (Danh mục) với sổ cái (nhật ký giao dịch) cho TẤT CẢ vật tư? Sổ cái (stockLedger) được coi là NGUỒN CHUẨN DUY NHẤT — nếu có chênh lệch, hệ thống sẽ SỬA LẠI số tồn kho hiển thị trong Danh mục cho khớp với tổng sổ cái. Sổ cái sẽ KHÔNG bị thay đổi.\n\nDùng khi nghi ngờ số tồn kho hiển thị (Danh mục/Dashboard) bị lệch do lỗi kỹ thuật, và muốn đưa nó về đúng với lịch sử giao dịch đã ghi nhận.', {okLabel:'Đồng ý, đối chiếu'}))) return;
   try {
     const ledgerSnap = await getDocs(collection(db,'stockLedger'));
     const balance = {};
@@ -4949,20 +4994,31 @@ window.reconcileInventory = async function(){
       balance[e.itemId] = (balance[e.itemId]||0) + (e.delta||0);
     });
     let fixedCount = 0;
+    const mismatches = [];
     for (const it of state.items) {
-      const ledgerBal = balance[it.id] || 0;
-      const actual = it.stock || 0;
-      const diff = actual - ledgerBal;
+      const ledgerBal = roundQty(balance[it.id] || 0);
+      const displayed = it.stock || 0;
+      const diff = displayed - ledgerBal;
       if (Math.abs(diff) > 0.0001) {
-        await addDoc(collection(db,'stockLedger'), {
-          itemId: it.id, delta: diff, type: 'reconcile', date: todayStr(),
-          note: 'Đối chiếu chênh lệch dữ liệu lịch sử', createdBy: state.userDoc.email, createdAt: serverTimestamp()
+        // Đọc lại items.stock NGAY TRƯỚC khi ghi (trong transaction) thay vì dùng thẳng giá trị
+        // `it.stock` đã lấy từ state ở đầu hàm — tránh trường hợp có giao dịch khác (nhập/xuất/SX...)
+        // vừa xảy ra cho đúng mã này trong lúc đang quét toàn bộ danh mục, khiến ta ghi đè lên 1 thay
+        // đổi hợp lệ vừa mới xảy ra sau thời điểm lấy ledgerSnap ở trên.
+        await runTransaction(db, async (tx) => {
+          const ref = doc(db,'items', it.id);
+          const snap = await tx.get(ref);
+          if (!snap.exists()) return;
+          tx.update(ref, { stock: ledgerBal, updatedAt: serverTimestamp() });
         });
+        mismatches.push({ code: it.code||'(không mã)', name: it.name, tonHienThiCu: displayed, tonSoCaiDung: ledgerBal, chenhLech: roundQty(diff) });
         fixedCount++;
       }
     }
-    toast(fixedCount ? `Đã đối chiếu và bổ sung ${fixedCount} dòng điều chỉnh — vào lại Báo cáo tồn kho và bấm "Tạo báo cáo" để xem số mới.` : 'Không có chênh lệch nào cần xử lý — nhật ký đã khớp với tồn kho thực tế.', 'success');
-    if (fixedCount) invalidateSnapshotsFrom(todayStr());
+    if (fixedCount) {
+      console.table(mismatches); // Chi tiết từng mã đã sửa — mở Console (F12) để đối chiếu/lưu lại nếu cần.
+      console.log('Đối chiếu tồn kho — danh sách mã đã sửa (items.stock được đưa về khớp Σ stockLedger):', mismatches);
+    }
+    toast(fixedCount ? `Đã sửa lại tồn kho hiển thị cho ${fixedCount} mã khớp với sổ cái — xem chi tiết trong Console (F12).` : 'Không có chênh lệch nào — tồn kho hiển thị đã khớp với sổ cái.', 'success');
   } catch(err){ toast('Lỗi: '+err.message, 'error'); }
 };
 
@@ -4983,23 +5039,35 @@ window.submitNewItem = async function(btn){
     if (!name) return toast('Vui lòng nhập tên vật tư.', 'error');
     if (!unit) return toast('Vui lòng nhập đơn vị tính.', 'error');
     try {
-      const itemRef = await addDoc(collection(db,'items'), { code, name, type, unit, stock, usesLot, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
-      if (stock !== 0) {
-        await addDoc(collection(db,'stockLedger'), {
-          itemId: itemRef.id, delta: stock, type: 'initial', date: todayStr(),
-          note: 'Tồn kho ban đầu khi tạo mã', createdBy: state.userDoc.email, createdAt: serverTimestamp()
-        });
-        invalidateSnapshotsFrom(todayStr());
-      }
-      if (usesLot) {
-        // Toàn bộ tồn kho ban đầu (nếu có) được coi là "lô chưa xác định" — chưa có phả hệ Casting thật.
-        await setDoc(unknownLotRef(itemRef.id), {
-          itemId: itemRef.id, lotCode: null, isUnknown: true, stage:'Unknown', parentLotCode: null,
-          dateSeg:'000000', xyzSeg:'000', ab:'00',
-          stock, status:'active', decoilCount:0, slitCount:0,
-          createdAt: serverTimestamp(), createdBy: state.userDoc.email
-        });
-      }
+      // FIX #1 (RCA lệch tồn kho, xem phân tích): trước đây đây là 3 lệnh ghi TÁCH RỜI
+      // (addDoc items → addDoc stockLedger → setDoc lô "chưa xác định"), không nguyên tử. Nếu 1
+      // trong 2 lệnh sau thất bại (mất mạng, đóng tab, lỗi quyền tạm thời...) SAU KHI mã hàng đã
+      // được tạo với stock ban đầu, thì items.stock có giá trị mà KHÔNG có dòng stockLedger 'initial'
+      // tương ứng — khiến Σ stockLedger (nguồn mà tab "Báo cáo tồn kho"/Sổ cái luôn tin tưởng) vĩnh
+      // viễn lệch khỏi items.stock cho đúng mã đó, không có cách nào tự phát hiện lại được. Gộp cả
+      // 3 việc vào 1 runTransaction duy nhất: HOẶC tất cả cùng thành công, HOẶC không có gì xảy ra —
+      // loại bỏ hoàn toàn khả năng tạo mã "nửa vời" kiểu này.
+      const itemRef = doc(collection(db,'items'));
+      await runTransaction(db, async (tx) => {
+        tx.set(itemRef, { code, name, type, unit, stock, usesLot, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+        if (stock !== 0) {
+          const ledgerRef = doc(collection(db,'stockLedger'));
+          tx.set(ledgerRef, {
+            itemId: itemRef.id, delta: stock, type: 'initial', date: todayStr(),
+            note: 'Tồn kho ban đầu khi tạo mã', createdBy: state.userDoc.email, createdAt: serverTimestamp()
+          });
+        }
+        if (usesLot) {
+          // Toàn bộ tồn kho ban đầu (nếu có) được coi là "lô chưa xác định" — chưa có phả hệ Casting thật.
+          tx.set(unknownLotRef(itemRef.id), {
+            itemId: itemRef.id, lotCode: null, isUnknown: true, stage:'Unknown', parentLotCode: null,
+            dateSeg:'000000', xyzSeg:'000', ab:'00',
+            stock, status:'active', decoilCount:0, slitCount:0,
+            createdAt: serverTimestamp(), createdBy: state.userDoc.email
+          });
+        }
+      });
+      if (stock !== 0) invalidateSnapshotsFrom(todayStr());
       toast('Đã thêm vật tư mới.', 'success');
       setTab('items');
     } catch(err){ toast('Lỗi: '+err.message, 'error'); }
