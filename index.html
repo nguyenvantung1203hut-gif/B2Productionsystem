@@ -479,7 +479,7 @@ import {
 import {
   getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, addDoc,
   collection, query, where, orderBy, onSnapshot, runTransaction,
-  serverTimestamp, getDocs, limit, startAfter
+  serverTimestamp, getDocs, limit, startAfter, deleteField
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
 let app, auth, db;
@@ -771,6 +771,9 @@ window.deleteTransaction = async function(collectionName, docId, label){
         parentLotRef = reportData.parentLotCode ? doc(db,'lots', reportData.parentLotCode) : unknownLotRef(reportData.parentItemId);
         parentLotSnap = await tx.get(parentLotRef);
       }
+      // Báo cáo xẻ băng dùng mã đầu vào nhập tay: đọc bộ đếm của mã đó để trả lại số thứ tự đã dùng.
+      const manualCounterRef = (reportData && reportData.manualBaseCode) ? manualBaseCounterRef(reportData.manualBaseCode) : null;
+      const manualCounterSnap = manualCounterRef ? await tx.get(manualCounterRef) : null;
 
       // Đọc trước lô "chưa xác định" cho từng dòng NVL/bán thành phẩm TIÊU THỤ theo BOM (reportData.
       // consumed) có bật mã lô — để hoàn tác đúng phần đã trừ đi lúc submit (xem consumedLotInfo trong
@@ -862,12 +865,15 @@ window.deleteTransaction = async function(collectionName, docId, label){
           // cuộn/Xẻ băng chỉ tăng `sliceCounter` đúng 1 (không phải decoilCount/slitCount như lô thật)
           // — xem chi tiết tại nhánh needsParentLot trong hàm submit báo cáo sản xuất. Hoàn tác tương
           // ứng: giảm sliceCounter đúng 1 nếu báo cáo này thực sự đã sinh ra lô con (numChildren>0).
-          if (numChildren>0) update.sliceCounter = Math.max(0, (p.sliceCounter||0) - 1);
+          if (numChildren>0 && !reportData.manualBaseCode) update.sliceCounter = Math.max(0, (p.sliceCounter||0) - 1);
         } else {
           if (reportData.stage === 'Decoiling' && numChildren>0) update.decoilCount = Math.max(0, (p.decoilCount||0) - numChildren);
           if (reportData.stage === 'Slitting' && numChildren>0) update.slitCount = Math.max(0, (p.slitCount||0) - numChildren);
         }
         tx.update(parentLotRef, update);
+      }
+      if (manualCounterSnap && manualCounterSnap.exists()) {
+        tx.update(manualCounterRef, { count: Math.max(0, (manualCounterSnap.data().count||0) - childLotCodes.length), updatedAt: serverTimestamp() });
       }
 
       // Hoàn tác lô "chưa xác định" cho các dòng NVL/bán thành phẩm tiêu thụ (đọc sẵn ở Pha 1) — cộng
@@ -1572,6 +1578,18 @@ function parseLotCode(code){
   if (!m) return null;
   return { dateSeg:m[1], xyzSeg:m[2], ab:m[3], cd:m[4], ef:m[5] };
 }
+/* ---- MÃ ĐẦU VÀO NHẬP TAY (Xẻ băng từ lô "Chưa xác định") ----
+   Người dùng nhập 1 mã đầu vào (mã cuộn gốc); các cuộn con sinh ra theo +01, +02...
+   - Nếu mã đầu vào đúng dạng YYMMDD-XYZ-ABCD00 -> cuộn con thay 2 số cuối: ...01, ...02 (giống lô thật).
+   - Ngược lại -> nối đuôi: <mã>-01, <mã>-02.
+   Số thứ tự được nhớ trong counters/inbase_<mã> để lần xẻ sau cùng mã đầu vào tiếp tục nối tiếp. */
+function normalizeBaseCode(v){ return String(v||'').trim().toUpperCase(); }
+function isValidBaseCode(c){ return /^[A-Z0-9][A-Z0-9._-]{3,39}$/.test(c); }
+function buildManualChildCode(base, seq){
+  const m = /^(\d{6}-\d{3}-\d{4})00$/.exec(base);
+  return m ? `${m[1]}${pad2(seq)}` : `${base}-${pad2(seq)}`;
+}
+function manualBaseCounterRef(base){ return doc(db,'counters','inbase_'+base); }
 function unknownLotDocId(itemId){ return 'UNKNOWN_' + itemId; }
 function unknownLotRef(itemId){ return doc(db, 'lots', unknownLotDocId(itemId)); }
 
@@ -1966,7 +1984,13 @@ async function readLotSnap(tx, itemId, lotRef){
 function writeLotDelta(tx, delta, lotInfo){
   const { ref, snap, itemId } = lotInfo;
   if (snap.exists()){
-    tx.update(ref, { stock: (snap.data().stock||0) + delta, updatedAt: serverTimestamp() });
+    const newStock = (snap.data().stock||0) + delta;
+    // FIX: lô "chưa xác định" từng bị dùng hết (Xẻ băng/Tháo cuộn/Xuất kho) có status='exhausted'.
+    // Khi nhập thêm hàng, trước đây chỉ cộng stock mà KHÔNG trả status về 'active' => lô có tồn nhưng
+    // bị bộ lọc status==='active' ở ô chọn lô cha loại bỏ (không hiện ở Tháo cuộn/Xẻ băng).
+    const upd = { stock: newStock, updatedAt: serverTimestamp() };
+    if (newStock > 0.0001) upd.status = 'active';
+    tx.update(ref, upd);
   } else {
     tx.set(ref, {
       itemId, lotCode: null, isUnknown: true, stage: 'Unknown', parentLotCode: null,
@@ -3378,6 +3402,13 @@ function renderParentLotPicker(){
       </div>
       ${isSlitting ? `<div class="field"><label>Khối lượng tiêu thụ từ lô này</label><input type="text" inputmode="decimal" id="prod-parent-qty" oninput="onProdParentQtyChange()" placeholder="0"></div>` : ''}
     </div>
+    ${isSlitting ? `<div id="prod-parent-base-wrap" class="hidden">
+      <div class="field">
+        <label>Mã đầu vào (mã cuộn gốc) — bắt buộc với lô "Chưa xác định"</label>
+        <input type="text" id="prod-parent-base" oninput="onProdParentBaseChange()" placeholder="VD: 260712-511-010200" autocomplete="off">
+        <p class="hint" id="prod-parent-base-preview" style="margin-top:4px;"></p>
+      </div>
+    </div>` : ''}
     <div id="prod-parent-lot-info" class="hint"></div>`;
   enhanceCombosIn(el); // kích hoạt ô gõ tìm kiếm cho select Lô cha — danh sách có thể dài hàng chục/trăm lô
 }
@@ -3387,18 +3418,44 @@ window.onProdParentLotChange = function(){
   const lots = window._prodParentLotsCache || [];
   const lot = lots.find(l=>l.id===lotDocId);
   const infoEl = document.getElementById('prod-parent-lot-info');
-  if (!lot) { prodParentLot = null; if (infoEl) infoEl.textContent=''; renderProdBalance(); return; }
+  if (!lot) { prodParentLot = null; syncParentBaseUI(null); if (infoEl) infoEl.textContent=''; renderProdBalance(); return; }
   const reprintBtn = (!lot.isUnknown && lot.lotCode) ? ` <button class="btn btn-ghost btn-sm" onclick="reprintLabel('${esc(lot.lotCode)}')" title="In lại tem cho lô này (VD tem rách/mất, hoặc in lại cho phần còn dư từ lần xẻ trước)">🖨 In lại tem cho lô này</button>` : '';
   if (prodSelectedStage === 'Decoiling') {
     prodParentLot = { itemId: lot.itemId, lotDocId: lot.id, lotCode: lot.lotCode, isUnknown: !!lot.isUnknown, stock: lot.stock, qty: lot.stock };
     if (infoEl) infoEl.innerHTML = `Sẽ tiêu thụ toàn bộ ${fmt(lot.stock)} ${itemUnit(lot.itemId)} của lô này (Tháo cuộn luôn dùng hết 1 lô).${reprintBtn}`;
   } else {
-    prodParentLot = { itemId: lot.itemId, lotDocId: lot.id, lotCode: lot.lotCode, isUnknown: !!lot.isUnknown, stock: lot.stock, qty: 0 };
+    prodParentLot = { itemId: lot.itemId, lotDocId: lot.id, lotCode: lot.lotCode, isUnknown: !!lot.isUnknown, stock: lot.stock, qty: 0, baseCode: '' };
+    syncParentBaseUI(lot);
     const qtyInput = document.getElementById('prod-parent-qty');
     if (qtyInput) qtyInput.value = '';
     if (infoEl) infoEl.innerHTML = `Tồn lô này: ${fmt(lot.stock)} ${itemUnit(lot.itemId)}.${reprintBtn}`;
   }
   renderProdBalance();
+};
+
+function syncParentBaseUI(lot){
+  const wrap = document.getElementById('prod-parent-base-wrap');
+  if (!wrap) return;
+  const input = document.getElementById('prod-parent-base');
+  if (input) input.value = '';
+  const prev = document.getElementById('prod-parent-base-preview');
+  if (prev) prev.textContent = '';
+  wrap.classList.toggle('hidden', !(lot && lot.isUnknown));
+}
+window.onProdParentBaseChange = function(){
+  if (!prodParentLot) return;
+  const base = normalizeBaseCode(document.getElementById('prod-parent-base').value);
+  prodParentLot.baseCode = base;
+  const prev = document.getElementById('prod-parent-base-preview');
+  if (!prev) return;
+  if (!base) { prev.textContent = ''; prev.style.color = ''; return; }
+  if (!isValidBaseCode(base)) {
+    prev.style.color = 'var(--danger-600)';
+    prev.textContent = 'Mã chỉ gồm chữ, số, dấu - _ . (4–40 ký tự), không có khoảng trắng.';
+    return;
+  }
+  prev.style.color = '';
+  prev.textContent = `Cuộn con sẽ có mã: ${buildManualChildCode(base,1)}, ${buildManualChildCode(base,2)}, … (tự +01 cho từng cuộn; nếu mã đầu vào này đã xẻ trước đó, số thứ tự nối tiếp).`;
 };
 
 window.onProdParentQtyChange = function(){
@@ -3729,6 +3786,11 @@ window.submitProduction = async function(btn){
   let secLotCodes = [];
   let parentRemainingStock = null; // tồn còn lại của lô cha sau khi trừ — dùng để mở lại panel in tem cho phần dư (VD xẻ băng dở cuộn)
   const parentSel = needsParentLot ? { ...prodParentLot } : null; // chốt lại lựa chọn tại thời điểm bấm Lưu
+  if (parentSel && parentSel.isUnknown && prodSelectedStage==='Slitting') {
+    const b = normalizeBaseCode(parentSel.baseCode);
+    if (!isValidBaseCode(b)) return toast('Lô cha là "Chưa xác định": vui lòng nhập Mã đầu vào (4–40 ký tự gồm chữ, số, - _ .).', 'error');
+    parentSel.baseCode = b;
+  }
 
   try {
     await runTransaction(db, async (tx) => {
@@ -3802,8 +3864,16 @@ window.submitProduction = async function(btn){
         const p0 = parentLotSnap.data();
         const isDecoiling0 = prodSelectedStage === 'Decoiling';
         const isReslit0 = !isDecoiling0 && p0.stage === 'Slitting';
+        const manualBase0 = (p0.isUnknown && !isDecoiling0 && parentSel.baseCode) ? parentSel.baseCode : null;
         let dateSeg0, xyzSeg0, ab0, parentCd0, parentSeqBase0, isUnknownSlice0 = false, newlyAllocatedXyz0 = null;
-        if (p0.isUnknown) {
+        if (p0.isUnknown && manualBase0) {
+          // Mã đầu vào NHẬP TAY: không cấp xyzSeg/AB, không tăng sliceCounter — số thứ tự con lấy từ
+          // counters/inbase_<mã đầu vào> để các lần xẻ sau cùng mã đầu vào nối tiếp, không trùng.
+          isUnknownSlice0 = true;
+          dateSeg0 = '000000'; xyzSeg0 = '000'; ab0 = '00'; parentCd0 = '00';
+          const bc = await tx.get(manualBaseCounterRef(manualBase0));
+          parentSeqBase0 = bc.exists() ? (bc.data().count||0) : 0;
+        } else if (p0.isUnknown) {
           // FIX LỖI TRÙNG MÃ (2 lớp):
           // (1) Giữa CÁC LẦN DÙNG của CÙNG 1 mã hàng: cấp AB mới cho mỗi lần checkout (xem bên dưới).
           // (2) Giữa CÁC MÃ HÀNG KHÁC NHAU: trước đây MỌI mã hàng đều dùng chung xyzSeg='000' cố định,
@@ -3834,7 +3904,9 @@ window.submitProduction = async function(btn){
           dateSeg0 = p0.dateSeg; xyzSeg0 = p0.xyzSeg; ab0 = p0.ab; parentCd0 = p0.cd || '00';
           parentSeqBase0 = isDecoiling0 ? (p0.decoilCount||0) : (p0.slitCount||0);
         }
-        const buildChild0 = (seqPadded) => isDecoiling0
+        const buildChild0 = (seqPadded) => manualBase0
+          ? (Number(seqPadded) > 99 ? (()=>{ throw new Error('Mã đầu vào này đã sinh quá 99 cuộn con — vui lòng dùng mã đầu vào khác.'); })() : buildManualChildCode(manualBase0, Number(seqPadded)))
+          : isDecoiling0
           ? buildLotCode(dateSeg0, xyzSeg0, ab0, seqPadded, '00')
           : isReslit0
             ? `${p0.lotCode}-S${seqPadded}`
@@ -3856,7 +3928,7 @@ window.submitProduction = async function(btn){
         }
         parentLotPlan = { p: p0, isDecoiling: isDecoiling0, isReslit: isReslit0, dateSeg: dateSeg0, xyzSeg: xyzSeg0,
           ab: ab0, parentCd: parentCd0, parentSeqBase: parentSeqBase0, isUnknownSlice: isUnknownSlice0,
-          newlyAllocatedXyz: newlyAllocatedXyz0, mainCode: mainCodePlanned, secCodesPlanned: secCodesPlanned0 };
+          newlyAllocatedXyz: newlyAllocatedXyz0, manualBase: manualBase0, mainCode: mainCodePlanned, secCodesPlanned: secCodesPlanned0 };
       } else {
         // Smelting/Recycle: không có lô cha cụ thể — tạm gộp đầu ra vào "lô chưa xác định" nếu vật tư có bật mã lô.
         if (mainNeedsLot) mainUnknownLotInfo = await readLotSnap(tx, outputItemId);
@@ -3913,7 +3985,7 @@ window.submitProduction = async function(btn){
         // parentSeqBase đã được tính sẵn VÀ kiểm tra không trùng mã ở PHA 1 (xem parentLotPlan) — ở đây
         // chỉ dùng lại, không tính lại, để đảm bảo khớp đúng 100% với mã đã kiểm tra trùng.
         const { isDecoiling, isReslit, dateSeg, xyzSeg, ab, parentCd, parentSeqBase, isUnknownSlice,
-          newlyAllocatedXyz, mainCode: mainCodePlanned, secCodesPlanned: secCodesPlanned0 } = parentLotPlan;
+          newlyAllocatedXyz, manualBase, mainCode: mainCodePlanned, secCodesPlanned: secCodesPlanned0 } = parentLotPlan;
         let childCounter = 0;
         const lotBaseChild = {
           isUnknown:false, stage: isDecoiling ? 'Decoiling' : 'Slitting',
@@ -3921,7 +3993,8 @@ window.submitProduction = async function(btn){
           dateSeg, xyzSeg, ab, status:'active', decoilCount:0, slitCount:0,
           createdAt: serverTimestamp(), createdBy: state.userDoc.email,
           ...(isReslit ? { reslitFrom: p.lotCode } : {}),
-          ...(isUnknownSlice ? { unknownSourceItemId: p.itemId } : {})
+          ...(isUnknownSlice ? { unknownSourceItemId: p.itemId } : {}),
+          ...(manualBase ? { manualCode: true, manualBaseCode: manualBase } : {})
         };
 
         if (mainNeedsLot) {
@@ -3949,7 +4022,9 @@ window.submitProduction = async function(btn){
           tx.set(UNKNOWN_LOT_XYZ_COUNTER_REF(), { next: newlyAllocatedXyz + 1, updatedAt: serverTimestamp() }, { merge: true });
         }
         if (childCounter > 0) {
-          if (isUnknownSlice) {
+          if (manualBase) {
+            tx.set(manualBaseCounterRef(manualBase), { count: parentSeqBase + childCounter, updatedAt: serverTimestamp() }, { merge: true });
+          } else if (isUnknownSlice) {
             // Chỉ tăng đúng 1 (không theo childCounter) — mỗi TRANSACTION là 1 lần "checkout" AB mới,
             // dù transaction đó sinh ra 1 hay nhiều lô con (đầu ra phụ) cùng lúc.
             parentUpdate.sliceCounter = (p.sliceCounter||0) + 1;
@@ -3974,6 +4049,7 @@ window.submitProduction = async function(btn){
         parentItemId: needsParentLot ? parentSel.itemId : null,
         parentLotCode: needsParentLot ? (parentSel.isUnknown ? null : parentSel.lotCode) : null,
         parentQty: needsParentLot ? parentSel.qty : null,
+        ...(parentLotPlan && parentLotPlan.manualBase ? { manualBaseCode: parentLotPlan.manualBase } : {}),
         outputLotCode: mainLotCode,
         secondaryOutputs: secondaryOutputs.map((r,idx)=>({ itemId:r.itemId, qty:r.qty, lotCode: secLotCodes[idx] })),
         consumed: prodConsumedRows.map(r=>({ itemId:r.itemId, plannedQty:r.plannedQty, actualQty:r.actualQty })),
@@ -4626,7 +4702,8 @@ function renderItems(){
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
       <div class="cond" style="font-weight:700;font-size:15px;">Toàn bộ danh mục</div>
-      ${isAdmin? `<button class="btn btn-ghost btn-sm" onclick="reconcileInventory()">Đối chiếu tồn kho (sửa lệch dữ liệu cũ)</button>`:''}
+      ${isAdmin? `<button class="btn btn-ghost btn-sm" onclick="reconcileInventory()">Đối chiếu tồn kho (sửa lệch dữ liệu cũ)</button>
+      <button class="btn btn-ghost btn-sm" onclick="cleanUnknownLotLocations()">Dọn dữ liệu lô chưa xác định</button>`:''}
     </div>
     <div class="field-row" style="margin-bottom:4px;">
       <div class="field" style="flex:2;">
@@ -5019,6 +5096,28 @@ window.reconcileInventory = async function(){
       console.log('Đối chiếu tồn kho — danh sách mã đã sửa (items.stock được đưa về khớp Σ stockLedger):', mismatches);
     }
     toast(fixedCount ? `Đã sửa lại tồn kho hiển thị cho ${fixedCount} mã khớp với sổ cái — xem chi tiết trong Console (F12).` : 'Không có chênh lệch nào — tồn kho hiển thị đã khớp với sổ cái.', 'success');
+  } catch(err){ toast('Lỗi: '+err.message, 'error'); }
+};
+
+/* DỌN "LÔ CHƯA XÁC ĐỊNH" — xem phân tích lỗi duplicate ở tab Kho thành phẩm.
+   Trước bản vá ở submitIssue/deleteTransaction, mỗi lần có người xuất kho (hoặc hoàn tác 1 phiếu xuất)
+   trực tiếp từ "Lô chưa xác định" (isUnknown:true), hệ thống lỡ ghi thêm field `location:'warehouse'`
+   lên chính document đó — dù lô chưa xác định KHÔNG BAO GIỜ nên có field này (nó không đi qua Đóng gói
+   như lô thật). Bug ghi field đã được sửa, và tab Kho thành phẩm cũng đã được vá để không đếm nhầm 2
+   lần dù field sai này còn tồn tại — nhưng field sai đó vẫn còn nằm trong dữ liệu cũ, có thể khiến các
+   màn hình khác (VD "Quản lý lô" của Admin) lọc/hiển thị nhầm trạng thái của các lô này. Hàm này CHỈ
+   xoá field `location` khỏi các document "lô chưa xác định" đang bị dính — KHÔNG đụng tới `stock` hay
+   bất kỳ field nào khác, KHÔNG ảnh hưởng tới tồn kho, không thể "hoàn tác nhầm" giao dịch nào cả, và an
+   toàn để chạy lại nhiều lần (lần sau sẽ không tìm thấy gì cần dọn nữa). */
+window.cleanUnknownLotLocations = async function(){
+  if (!requireAdmin()) return;
+  if (!(await appConfirm('Dọn dữ liệu "Lô chưa xác định": gỡ bỏ field vị trí (location) bị ghi nhầm do 1 lỗi đã sửa trước đó (không đụng tới số tồn kho của bất kỳ lô/mã hàng nào). Tiếp tục?', {okLabel:'Đồng ý, dọn dữ liệu'}))) return;
+  try {
+    const unkSnap = await getDocs(query(collection(db,'lots'), where('isUnknown','==',true)));
+    const toClean = unkSnap.docs.filter(d => d.data().location !== undefined);
+    if (!toClean.length) { toast('Không có lô "chưa xác định" nào bị dính dữ liệu sai cần dọn.', 'success'); return; }
+    await Promise.all(toClean.map(d => updateDoc(d.ref, { location: deleteField(), updatedAt: serverTimestamp() })));
+    toast(`Đã dọn xong ${toClean.length} lô "chưa xác định" bị dính dữ liệu sai.`, 'success');
   } catch(err){ toast('Lỗi: '+err.message, 'error'); }
 };
 
